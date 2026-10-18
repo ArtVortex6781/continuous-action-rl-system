@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.idea/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Local experiment results
+/runs/
+/outputs/
+
+# Build
+build/
+dist/
+*.egg-info/
+
