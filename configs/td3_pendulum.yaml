@@ -1,0 +1,11 @@
+environment:
+  id: Pendulum-v1
+  kwargs: {}
+
+algorithm:
+  name: td3
+  params: {}
+
+training:
+  total_steps: 100000
+  seed: 42
