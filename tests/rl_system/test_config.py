@@ -36,12 +36,12 @@ def test_run_config_valid(valid_data):
     assert config.algorithm.params == {}
     assert config.training.total_steps == 100_000
     assert config.training.seed == 42
-    assert config.model_dump(mode="json") == valid_data
+    assert config.model_dump(mode = "json") == valid_data
 
 
 def test_environment_kwargs_default_is_independent():
-    first = EnvironmentConfig(id="Pendulum-v1")
-    second = EnvironmentConfig(id="Pendulum-v1")
+    first = EnvironmentConfig(id = "Pendulum-v1")
+    second = EnvironmentConfig(id = "Pendulum-v1")
 
     assert first.kwargs == second.kwargs == {}
     assert first.kwargs is not second.kwargs
@@ -75,29 +75,29 @@ def test_required_sections(valid_data, section):
 @pytest.mark.parametrize("invalid", [0, -1, 3.5, True, "100", None])
 def test_total_steps_must_be_positive_strict_int(invalid):
     with pytest.raises(ValidationError):
-        TrainingConfig(total_steps=invalid, seed=42)
+        TrainingConfig(total_steps = invalid, seed = 42)
 
 
 @pytest.mark.parametrize("invalid", [-1, 1.5, False, "42", None])
 def test_seed_must_be_nonnegative_strict_int(invalid):
     with pytest.raises(ValidationError):
-        TrainingConfig(total_steps=1, seed=invalid)
+        TrainingConfig(total_steps = 1, seed = invalid)
 
 
 def test_zero_seed_is_valid():
-    assert TrainingConfig(total_steps=1, seed=0).seed == 0
+    assert TrainingConfig(total_steps = 1, seed = 0).seed == 0
 
 
 @pytest.mark.parametrize("invalid", ["", "   ", 123, None])
 def test_environment_id_must_be_nonblank_string(invalid):
     with pytest.raises(ValidationError):
-        EnvironmentConfig(id=invalid)
+        EnvironmentConfig(id = invalid)
 
 
 @pytest.mark.parametrize("invalid", ["", "\t  ", 123, None])
 def test_algorithm_name_must_be_nonblank_string(invalid):
     with pytest.raises(ValidationError):
-        AlgorithmConfig(name=invalid, params={})
+        AlgorithmConfig(name = invalid, params = {})
 
 
 @pytest.mark.parametrize("section", [None, "environment", "algorithm", "training"])
@@ -112,17 +112,17 @@ def test_extra_fields_are_forbidden(valid_data, section):
 @pytest.mark.parametrize(
     ("model", "field", "replacement"),
     [
-        (EnvironmentConfig(id="Pendulum-v1"), "id", "Other-v1"),
-        (AlgorithmConfig(name="td3", params={}), "name", "sac"),
-        (TrainingConfig(total_steps=100, seed=42), "seed", 4),
+        (EnvironmentConfig(id = "Pendulum-v1"), "id", "Other-v1"),
+        (AlgorithmConfig(name = "td3", params = {}), "name", "sac"),
+        (TrainingConfig(total_steps = 100, seed = 42), "seed", 4),
         (
-            RunConfig(
-                environment=EnvironmentConfig(id="Pendulum-v1"),
-                algorithm=AlgorithmConfig(name="td3", params={}),
-                training=TrainingConfig(total_steps=100, seed=42),
-            ),
-            "training",
-            TrainingConfig(total_steps=200, seed=42),
+                RunConfig(
+                    environment = EnvironmentConfig(id = "Pendulum-v1"),
+                    algorithm = AlgorithmConfig(name = "td3", params = {}),
+                    training = TrainingConfig(total_steps = 100, seed = 42),
+                ),
+                "training",
+                TrainingConfig(total_steps = 200, seed = 42),
         ),
     ],
 )
@@ -135,8 +135,8 @@ def test_models_are_frozen(model, field, replacement):
 def test_nested_json_values_are_accepted():
     payload = {"items": [None, True, False, 0, 1.5, "text", {"nested": [1, 2]}]}
 
-    environment = EnvironmentConfig(id="Pendulum-v1", kwargs=deepcopy(payload))
-    algorithm = AlgorithmConfig(name="td3", params=deepcopy(payload))
+    environment = EnvironmentConfig(id = "Pendulum-v1", kwargs = deepcopy(payload))
+    algorithm = AlgorithmConfig(name = "td3", params = deepcopy(payload))
 
     assert environment.kwargs == payload
     assert algorithm.params == payload
@@ -176,7 +176,7 @@ def test_cyclic_json_structure_is_rejected():
     payload = {}
     payload["self"] = payload
     with pytest.raises(ValidationError):
-        AlgorithmConfig(name="td3", params=payload)
+        AlgorithmConfig(name = "td3", params = payload)
 
 
 def test_run_config_rejects_wrong_nested_types(valid_data):
@@ -184,8 +184,6 @@ def test_run_config_rejects_wrong_nested_types(valid_data):
     with pytest.raises(ValidationError):
         RunConfig.model_validate(valid_data)
 
-
-# Step 3/3: YAML loader and public load_config() contract.
 
 VALID_YAML = """\
 environment:
@@ -207,34 +205,34 @@ def test_load_project_example_yaml(valid_data):
     config = load_config(project_root / "configs" / "td3_pendulum.yaml")
 
     assert isinstance(config, RunConfig)
-    assert config.model_dump(mode="json") == valid_data
+    assert config.model_dump(mode = "json") == valid_data
 
 
 @pytest.mark.parametrize("use_str_path", [False, True])
 def test_load_config_accepts_path_and_string(tmp_path, valid_data, use_str_path):
     config_file = tmp_path / "run.yaml"
-    config_file.write_text(VALID_YAML, encoding="utf-8")
+    config_file.write_text(VALID_YAML, encoding = "utf-8")
 
     path = str(config_file) if use_str_path else config_file
     config = load_config(path)
 
     assert isinstance(config, RunConfig)
-    assert config.model_dump(mode="json") == valid_data
+    assert config.model_dump(mode = "json") == valid_data
 
 
 @pytest.mark.parametrize(
     "content",
     [
-        "",                                 # Empty YAML file.
-        "# only a comment\n",              # YAML parsing yields None.
-        "[]\n",                             # Invalid root type.
+        "",
+        "# only a comment\n",
+        "[]\n",
         VALID_YAML.replace("  seed: 42", "  seed: true"),
-        VALID_YAML + "unexpected: 1\n",       # Unknown top-level field.
+        VALID_YAML + "unexpected: 1\n",
     ],
 )
 def test_load_config_rejects_invalid_schema(tmp_path, content):
     config_file = tmp_path / "invalid.yaml"
-    config_file.write_text(content, encoding="utf-8")
+    config_file.write_text(content, encoding = "utf-8")
 
     with pytest.raises(InvalidConfigError) as exc_info:
         load_config(config_file)
@@ -244,7 +242,7 @@ def test_load_config_rejects_invalid_schema(tmp_path, content):
 
 def test_load_config_rejects_malformed_yaml(tmp_path):
     config_file = tmp_path / "malformed.yaml"
-    config_file.write_text("environment: [\n", encoding="utf-8")
+    config_file.write_text("environment: [\n", encoding = "utf-8")
 
     with pytest.raises(InvalidConfigError) as exc_info:
         load_config(config_file)
@@ -269,7 +267,7 @@ def test_load_config_rejects_malformed_yaml(tmp_path):
 )
 def test_load_config_rejects_duplicate_yaml_keys(tmp_path, content):
     config_file = tmp_path / "duplicate.yaml"
-    config_file.write_text(content, encoding="utf-8")
+    config_file.write_text(content, encoding = "utf-8")
 
     with pytest.raises(InvalidConfigError) as exc_info:
         load_config(config_file)
@@ -303,7 +301,7 @@ def test_load_config_defers_algorithm_support_check(tmp_path):
     config_file = tmp_path / "unknown_algorithm.yaml"
     config_file.write_text(
         VALID_YAML.replace("name: td3", "name: not_implemented_yet"),
-        encoding="utf-8",
+        encoding = "utf-8",
     )
 
     config = load_config(config_file)
