@@ -12,3 +12,19 @@ class InvalidConfigError(ConfigurationError):
 
 class UnsupportedConfigError(ConfigurationError):
     """Запрошенная конфигурация не поддерживается системой."""
+
+
+class UnsupportedSpaceError(UnsupportedConfigError):
+    """Неподдерживаемое пространство наблюдений или действий."""
+
+
+class EnvironmentSystemError(RLSystemError):
+    """Базовая ошибка подсистемы Environment."""
+
+
+class EnvironmentDependencyError(EnvironmentSystemError):
+    """Отсутствует зависимость, необходимая для среды."""
+
+
+class EnvironmentCreationError(EnvironmentSystemError):
+    """Ошибка создания Gymnasium-среды."""
