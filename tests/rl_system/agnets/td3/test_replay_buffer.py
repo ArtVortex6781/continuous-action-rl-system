@@ -1,4 +1,4 @@
-"""Unit tests for the off-policy contract and Replay Buffer write path."""
+"""Unit tests for the off-policy contract and Replay Buffer storage and sampling."""
 
 from dataclasses import FrozenInstanceError, fields, is_dataclass
 from inspect import Parameter, signature
@@ -325,3 +325,157 @@ def test_failed_add_does_not_modify_existing_transitions_or_indices(
     assert (buffer.ptr, buffer.size, len(buffer)) == initial_state
     for name, expected in existing.items():
         np.testing.assert_array_equal(getattr(buffer, name)[:count], expected)
+
+
+def _assert_batch_rows_match_transitions(
+        batch: ReplayBatch, possible_steps: set[int]
+) -> list[int]:
+    """Check that all fields in each sampled row belong to one stored transition."""
+    sampled_steps = []
+    for index in range(batch.obs.shape[0]):
+        step = int(batch.obs[index, 0] - 0.25)
+        assert step in possible_steps
+        expected = _transition(step)
+
+        np.testing.assert_array_equal(batch.obs[index], expected["obs"].astype(np.float32))
+        np.testing.assert_array_equal(
+            batch.actions[index], expected["action"].astype(np.float32)
+        )
+        np.testing.assert_array_equal(
+            batch.next_obs[index], expected["next_obs"].astype(np.float32)
+        )
+        assert batch.rewards[index, 0] == np.float32(expected["reward"])
+        assert batch.terminated[index, 0] == expected["terminated"]
+        assert batch.truncated[index, 0] == expected["truncated"]
+        sampled_steps.append(step)
+    return sampled_steps
+
+
+@pytest.mark.parametrize("batch_size", [1, 2, 3])
+def test_sample_returns_aligned_batch_with_approved_shapes_and_dtypes(buffer, batch_size):
+    for step in range(3):
+        buffer.add(**_transition(step))
+    initial_state = (buffer.ptr, buffer.size)
+
+    batch = buffer.sample(batch_size)
+
+    assert isinstance(batch, ReplayBatch)
+    expected = {
+        "obs": ((batch_size, 2), np.dtype("float32")),
+        "actions": ((batch_size, 2), np.dtype("float32")),
+        "rewards": ((batch_size, 1), np.dtype("float32")),
+        "next_obs": ((batch_size, 2), np.dtype("float32")),
+        "terminated": ((batch_size, 1), np.dtype("bool")),
+        "truncated": ((batch_size, 1), np.dtype("bool")),
+    }
+    for name, (shape, dtype) in expected.items():
+        assert getattr(batch, name).shape == shape
+        assert getattr(batch, name).dtype == dtype
+
+    steps = _assert_batch_rows_match_transitions(batch, {0, 1, 2})
+    assert len(steps) == len(set(steps)) == batch_size
+    assert (buffer.ptr, buffer.size) == initial_state
+
+
+def test_sample_uses_only_filled_rows_before_reaching_capacity():
+    buffer = ReplayBuffer(capacity = 7, obs_dim = 2, act_dim = 2, seed = 42)
+    for step in range(3):
+        buffer.add(**_transition(step))
+
+    batch = buffer.sample(3)
+
+    steps = _assert_batch_rows_match_transitions(batch, {0, 1, 2})
+    assert set(steps) == {0, 1, 2}
+    assert len(buffer) == 3
+
+
+def test_sample_after_ring_overwrite_excludes_evicted_transitions(buffer):
+    for step in range(8):
+        buffer.add(**_transition(step))
+    assert buffer.ptr == 2
+    assert len(buffer) == 3
+
+    batch = buffer.sample(buffer.capacity)
+
+    steps = _assert_batch_rows_match_transitions(batch, {5, 6, 7})
+    assert set(steps) == {5, 6, 7}
+
+
+def test_sample_reproducible_across_buffers_with_same_seed_and_operations():
+    first = ReplayBuffer(capacity = 6, obs_dim = 2, act_dim = 2, seed = 123)
+    second = ReplayBuffer(capacity = 6, obs_dim = 2, act_dim = 2, seed = 123)
+    for step in range(9):
+        first.add(**_transition(step))
+        second.add(**_transition(step))
+
+    for batch_size in (3, 5, 1, 6, 2):
+        first_batch = first.sample(batch_size)
+        second_batch = second.sample(batch_size)
+        for name in STORAGE_FIELDS:
+            np.testing.assert_array_equal(
+                getattr(first_batch, name), getattr(second_batch, name)
+            )
+
+
+def test_sample_returns_independent_arrays_not_views_into_storage(buffer):
+    for step in range(3):
+        buffer.add(**_transition(step))
+    saved = {name: getattr(buffer, name).copy() for name in STORAGE_FIELDS}
+
+    batch = buffer.sample(3)
+    for name in STORAGE_FIELDS:
+        sampled = getattr(batch, name)
+        assert not np.shares_memory(sampled, getattr(buffer, name))
+        if sampled.dtype == np.dtype("bool"):
+            sampled[:] = ~sampled
+        else:
+            sampled[:] = -999.0
+
+    for name, original in saved.items():
+        np.testing.assert_array_equal(getattr(buffer, name), original)
+
+
+@pytest.mark.parametrize("batch_size", [True, False, 1.0, "1", None, np.int64(1)])
+def test_sample_rejects_non_plain_integer_batch_size(buffer, batch_size):
+    buffer.add(**_transition(0))
+    with pytest.raises(TypeError, match = "batch_size"):
+        buffer.sample(batch_size)
+
+
+@pytest.mark.parametrize("batch_size", [0, -1, -5])
+def test_sample_rejects_nonpositive_batch_size(buffer, batch_size):
+    buffer.add(**_transition(0))
+    with pytest.raises(ValueError, match = "positive"):
+        buffer.sample(batch_size)
+
+
+@pytest.mark.parametrize("stored,requested", [(0, 1), (1, 2), (2, 3)])
+def test_sample_rejects_requests_larger_than_stored_size(buffer, stored, requested):
+    for step in range(stored):
+        buffer.add(**_transition(step))
+    with pytest.raises(ValueError, match = "exceeds stored transitions"):
+        buffer.sample(requested)
+
+
+def test_rejected_sample_does_not_change_buffer_or_advance_its_rng():
+    first = ReplayBuffer(capacity = 4, obs_dim = 2, act_dim = 2, seed = 9)
+    second = ReplayBuffer(capacity = 4, obs_dim = 2, act_dim = 2, seed = 9)
+    for step in range(4):
+        first.add(**_transition(step))
+        second.add(**_transition(step))
+    saved = {name: getattr(first, name).copy() for name in STORAGE_FIELDS}
+    initial_state = (first.ptr, first.size)
+
+    with pytest.raises(ValueError):
+        first.sample(5)
+    with pytest.raises(TypeError):
+        first.sample(True)
+
+    assert (first.ptr, first.size) == initial_state
+    first_batch = first.sample(4)
+    second_batch = second.sample(4)
+    for name in STORAGE_FIELDS:
+        np.testing.assert_array_equal(getattr(first, name), saved[name])
+        np.testing.assert_array_equal(
+            getattr(first_batch, name), getattr(second_batch, name)
+        )
