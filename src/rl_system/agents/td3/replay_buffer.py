@@ -176,3 +176,33 @@ class ReplayBuffer:
         :return: count between zero and the configured capacity.
         """
         return self.size
+
+    def sample(self, batch_size: int) -> ReplayBatch:
+        """Sample aligned transitions uniformly without replacement.
+
+        Uses the buffer's own random generator and returns independent NumPy
+        arrays so changes to a sampled batch cannot modify stored transitions.
+
+        :param batch_size: positive number of distinct stored transitions to sample.
+        :return: batch of six arrays indexed by the same sampled positions.
+        :raises TypeError: if batch_size is not an ordinary integer.
+        :raises ValueError: if batch_size is nonpositive or exceeds stored size.
+        """
+        if type(batch_size) is not int:
+            raise TypeError("batch_size must be an integer (not bool)")
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        if batch_size > self.size:
+            raise ValueError(
+                f"batch_size ({batch_size}) exceeds stored transitions ({self.size})"
+            )
+
+        indices = self._rng.choice(self.size, size = batch_size, replace = False)
+        return ReplayBatch(
+            obs = self.obs[indices],
+            actions = self.actions[indices],
+            rewards = self.rewards[indices],
+            next_obs = self.next_obs[indices],
+            terminated = self.terminated[indices],
+            truncated = self.truncated[indices],
+        )
