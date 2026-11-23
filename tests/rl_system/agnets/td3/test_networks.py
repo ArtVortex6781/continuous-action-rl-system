@@ -1,11 +1,11 @@
-"""Unit tests for TD3 network builders, beginning with the Actor."""
+"""Unit tests for TD3 Actor and Critic network builders."""
 
 import keras
 import numpy as np
 import pytest
 
 from rl_system.agents.td3.config import MLPConfig
-from rl_system.agents.td3.networks import build_actor
+from rl_system.agents.td3.networks import build_actor, build_critic
 from rl_system.environment import EnvironmentSpec
 
 
@@ -148,3 +148,161 @@ def test_actor_rejects_invalid_output_initializer_limits(actor_config, invalid_l
             actor_config,
             output_init_limit = invalid_limit,
         )
+
+
+@pytest.fixture
+def critic_config() -> MLPConfig:
+    return MLPConfig(
+        hidden_units = [32, 16], hidden_activations = ["relu", "elu"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("observation_dim", "action_dim", "batch_size"),
+    [(3, 1, 1), (5, 2, 4), (1, 4, 7)],
+)
+def test_critic_accepts_observations_and_real_scale_actions(
+        critic_config, observation_dim, action_dim, batch_size
+):
+    spec = _environment_spec(observation_dim, action_dim)
+    critic = build_critic(spec, critic_config)
+
+    assert isinstance(critic, keras.Model)
+    assert len(critic.inputs) == 2
+    assert critic.input_shape == [(None, observation_dim), (None, action_dim)]
+    assert critic.output_shape == (None, 1)
+    assert [tensor.name for tensor in critic.inputs] == ["observation", "action"]
+
+    observations = np.linspace(
+        -1.0, 1.0, batch_size * observation_dim, dtype = np.float32
+    ).reshape(batch_size, observation_dim)
+    # Use actual environment bounds rather than Actor's normalized [-1, 1] values.
+    actions = np.broadcast_to(
+        (spec.action_low + spec.action_high) / 2,
+        (batch_size, action_dim),
+    ).copy()
+    q_values = keras.ops.convert_to_numpy(
+        critic([observations, actions], training = False)
+    )
+
+    assert q_values.shape == (batch_size, 1)
+    assert np.all(np.isfinite(q_values))
+    assert critic.compiled is False
+
+
+@pytest.mark.parametrize(
+    ("units", "activations"),
+    [
+        ([8], ["relu"]),
+        ([16, 8], ["tanh", "elu"]),
+        ([32, 16, 8, 4], ["relu", "swish", "elu", "tanh"]),
+    ],
+)
+def test_critic_uses_early_concatenation_and_configured_hidden_layers(
+        units, activations
+):
+    spec = _environment_spec(observation_dim = 3, action_dim = 2)
+    config = MLPConfig(hidden_units = units, hidden_activations = activations)
+    critic = build_critic(spec, config)
+
+    assert len(critic.layers) == len(units) + 4
+    assert all(isinstance(layer, keras.layers.InputLayer) for layer in critic.layers[:2])
+
+    concatenation = critic.layers[2]
+    assert isinstance(concatenation, keras.layers.Concatenate)
+    assert concatenation.name == "critic_concat"
+    assert len(concatenation.input) == 2
+    assert concatenation.output.shape == (None, spec.observation_dim + spec.action_dim)
+
+    hidden_layers = critic.layers[3:-1]
+    for index, (layer, expected_units, expected_activation) in enumerate(
+            zip(hidden_layers, units, activations, strict = True), start = 1
+    ):
+        assert isinstance(layer, keras.layers.Dense)
+        assert layer.name == f"critic_hidden_{index}"
+        assert layer.units == expected_units
+        assert layer.activation is keras.activations.get(expected_activation)
+        assert isinstance(layer.kernel_initializer, keras.initializers.GlorotUniform)
+        assert isinstance(layer.bias_initializer, keras.initializers.Zeros)
+
+    output = critic.layers[-1]
+    assert isinstance(output, keras.layers.Dense)
+    assert output.name == "critic_q"
+    assert output.units == 1
+    assert output.activation is keras.activations.linear
+
+
+def test_critic_does_not_normalize_actions_or_restrict_q_values():
+    spec = EnvironmentSpec(
+        observation_dim = 2,
+        action_dim = 1,
+        action_low = np.array([10.0], dtype = np.float32),
+        action_high = np.array([20.0], dtype = np.float32),
+    )
+    config = MLPConfig(hidden_units = [1], hidden_activations = ["relu"])
+    critic = build_critic(spec, config)
+
+    # Q = -action: observation weights are zero; the action weight is one.
+    hidden = critic.get_layer("critic_hidden_1")
+    hidden_kernel, hidden_bias = hidden.get_weights()
+    hidden_kernel.fill(0.0)
+    hidden_kernel[spec.observation_dim, 0] = 1.0
+    hidden.set_weights([hidden_kernel, np.zeros_like(hidden_bias)])
+
+    output = critic.get_layer("critic_q")
+    output_kernel, output_bias = output.get_weights()
+    output.set_weights([
+        np.full_like(output_kernel, -1.0),
+        np.zeros_like(output_bias),
+    ])
+
+    observations = np.zeros((2, spec.observation_dim), dtype = np.float32)
+    actions = np.array([[12.0], [15.0]], dtype = np.float32)
+    q_values = keras.ops.convert_to_numpy(
+        critic([observations, actions], training = False)
+    )
+
+    np.testing.assert_allclose(
+        q_values, np.array([[-12.0], [-15.0]], dtype = np.float32),
+        rtol = 0, atol = 1e-5,
+    )
+
+
+def test_separately_built_critics_have_independent_trainable_variables(critic_config):
+    spec = _environment_spec(observation_dim = 3, action_dim = 2)
+    critic_1 = build_critic(spec, critic_config)
+    critic_2 = build_critic(spec, critic_config)
+
+    assert critic_1 is not critic_2
+    assert len(critic_1.trainable_variables) == len(critic_2.trainable_variables)
+    assert critic_1.trainable_variables
+    assert all(
+        left is not right
+        for left, right in zip(
+            critic_1.trainable_variables, critic_2.trainable_variables, strict = True
+        )
+    )
+
+    critic_2_weights_before = [value.copy() for value in critic_2.get_weights()]
+    critic_1_weights = critic_1.get_weights()
+    critic_1_weights[0] = critic_1_weights[0] + 1.0
+    critic_1.set_weights(critic_1_weights)
+
+    for before, after in zip(
+            critic_2_weights_before, critic_2.get_weights(), strict = True
+    ):
+        np.testing.assert_array_equal(after, before)
+
+
+def test_actor_and_critic_can_use_different_mlp_configs():
+    spec = _environment_spec(observation_dim = 4, action_dim = 2)
+    actor_config = MLPConfig(hidden_units = [8], hidden_activations = ["relu"])
+    critic_config = MLPConfig(
+        hidden_units = [12, 6], hidden_activations = ["swish", "elu"]
+    )
+
+    actor = build_actor(spec, actor_config, output_init_limit = 0.003)
+    critic = build_critic(spec, critic_config)
+
+    assert [layer.units for layer in actor.layers if isinstance(layer, keras.layers.Dense)] == [8, 2]
+    assert [layer.units for layer in critic.layers if isinstance(layer, keras.layers.Dense)] == [12, 6, 1]
