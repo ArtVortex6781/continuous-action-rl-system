@@ -60,3 +60,37 @@ def build_actor(
     )(hidden)
 
     return keras.Model(inputs = observation, outputs = action, name = "actor")
+
+
+def build_critic(spec: "EnvironmentSpec", config: MLPConfig) -> keras.Model:
+    """Build a Critic estimating a scalar Q-value for observation-action pairs.
+
+    Observations and actions enter through separate inputs and are concatenated
+    before all configurable hidden Dense layers. Actions must use the actual
+    environment scale rather than the Actor's normalized ``[-1, 1]`` scale.
+
+    :param spec: validated environment observation and action dimensions.
+    :param config: validated hidden-layer sizes and activations.
+    :return: uncompiled Keras Critic with output shape ``(batch, 1)``.
+    """
+    observation = keras.Input(
+        shape = (spec.observation_dim,), name = "observation"
+    )
+    action = keras.Input(shape = (spec.action_dim,), name = "action")
+
+    hidden = keras.layers.Concatenate(name = "critic_concat")([observation, action])
+    for index, (units, activation) in enumerate(
+            zip(config.hidden_units, config.hidden_activations, strict = True),
+            start = 1,
+    ):
+        hidden = keras.layers.Dense(
+            units, activation = activation, name = f"critic_hidden_{index}"
+        )(hidden)
+
+    q_value = keras.layers.Dense(
+        1, activation = "linear", name = "critic_q"
+    )(hidden)
+
+    return keras.Model(
+        inputs = [observation, action], outputs = q_value, name = "critic"
+    )
