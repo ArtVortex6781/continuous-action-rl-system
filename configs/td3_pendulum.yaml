@@ -4,7 +4,31 @@ environment:
 
 algorithm:
   name: td3
-  params: {}
+  params:
+    replay_capacity: 100000
+    batch_size: 256
+
+    gamma: 0.99
+    tau: 0.005
+
+    actor_learning_rate: 0.001
+    critic_learning_rate: 0.001
+
+    policy_delay: 2
+
+    exploration_noise_std: 0.1
+    target_policy_noise_std: 0.2
+    target_noise_clip: 0.5
+
+    actor_output_init_limit: 0.003
+
+    actor:
+      hidden_units: [512, 256]
+      hidden_activations: [relu, relu]
+
+    critic:
+      hidden_units: [512, 256]
+      hidden_activations: [relu, relu]
 
 training:
   total_steps: 100000
