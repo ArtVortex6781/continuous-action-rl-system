@@ -1,11 +1,11 @@
-"""Unit tests for TD3 Actor and Critic network builders."""
+"""Unit tests for TD3 Actor, Critic and target network builders."""
 
 import keras
 import numpy as np
 import pytest
 
 from rl_system.agents.td3.config import MLPConfig
-from rl_system.agents.td3.networks import build_actor, build_critic
+from rl_system.agents.td3.networks import build_actor, build_critic, create_target_network
 from rl_system.environment import EnvironmentSpec
 
 
@@ -306,3 +306,113 @@ def test_actor_and_critic_can_use_different_mlp_configs():
 
     assert [layer.units for layer in actor.layers if isinstance(layer, keras.layers.Dense)] == [8, 2]
     assert [layer.units for layer in critic.layers if isinstance(layer, keras.layers.Dense)] == [12, 6, 1]
+
+
+def _network_inputs(spec, kind):
+    observations = np.linspace(-0.5, 0.5, 3 * spec.observation_dim,
+                               dtype = np.float32).reshape(3, spec.observation_dim)
+    if kind == "actor":
+        return observations
+    actions = np.broadcast_to(
+        (spec.action_low + spec.action_high) / 2, (3, spec.action_dim)
+    ).copy()
+    return [observations, actions]
+
+
+@pytest.mark.parametrize("kind", ["actor", "critic"])
+def test_target_network_matches_main_initially_and_has_independent_weights(kind):
+    spec = _environment_spec(4, 2)
+    config = MLPConfig(hidden_units = [12, 8], hidden_activations = ["tanh", "swish"])
+    main = (build_actor(spec, config, output_init_limit = 0.003)
+            if kind == "actor" else build_critic(spec, config))
+    target = create_target_network(main)
+
+    assert target is not main
+    assert target.input_shape == main.input_shape
+    assert target.output_shape == main.output_shape
+    assert target.compiled is False
+    assert len(target.layers) == len(main.layers)
+    assert all(a is not b for a, b in zip(main.layers, target.layers, strict = True))
+    assert main.weights and target.weights
+    assert {id(v) for v in main.weights}.isdisjoint(id(v) for v in target.weights)
+    for expected, actual in zip(main.get_weights(), target.get_weights(), strict = True):
+        np.testing.assert_array_equal(actual, expected)
+
+    inputs = _network_inputs(spec, kind)
+    np.testing.assert_allclose(
+        keras.ops.convert_to_numpy(target(inputs, training = False)),
+        keras.ops.convert_to_numpy(main(inputs, training = False)),
+        rtol = 1e-6, atol = 1e-7,
+    )
+
+    target_before = target.get_weights()
+    main.set_weights([w + 0.25 for w in main.get_weights()])
+    for before, after in zip(target_before, target.get_weights(), strict = True):
+        np.testing.assert_array_equal(after, before)
+
+    main_before = main.get_weights()
+    target.set_weights([w - 0.5 for w in target.get_weights()])
+    for before, after in zip(main_before, main.get_weights(), strict = True):
+        np.testing.assert_array_equal(after, before)
+
+
+def _build_six_networks(spec, actor_config, critic_config):
+    actor = build_actor(spec, actor_config, output_init_limit = 0.003)
+    critic_1 = build_critic(spec, critic_config)
+    critic_2 = build_critic(spec, critic_config)
+    main = (actor, critic_1, critic_2)
+    targets = tuple(create_target_network(model) for model in main)
+    return main, targets
+
+
+@pytest.mark.parametrize(("observation_dim", "action_dim"), [(3, 1), (8, 2)])
+def test_all_six_networks_can_be_built_without_shared_variables(
+        actor_config, critic_config, observation_dim, action_dim
+):
+    spec = _environment_spec(observation_dim, action_dim)
+    main, targets = _build_six_networks(spec, actor_config, critic_config)
+    models = main + targets
+    assert len({id(model) for model in models}) == 6
+    variables = [v for model in models for v in model.weights]
+    assert len({id(v) for v in variables}) == len(variables)
+
+    for index, (source, target) in enumerate(zip(main, targets, strict = True)):
+        kind = "actor" if index == 0 else "critic"
+        inputs = _network_inputs(spec, kind)
+        expected_shape = (3, action_dim if index == 0 else 1)
+        source_output = keras.ops.convert_to_numpy(source(inputs, training = False))
+        target_output = keras.ops.convert_to_numpy(target(inputs, training = False))
+        assert source_output.shape == target_output.shape == expected_shape
+        assert np.all(np.isfinite(source_output))
+        assert np.all(np.isfinite(target_output))
+        for a, b in zip(source.get_weights(), target.get_weights(), strict = True):
+            np.testing.assert_array_equal(a, b)
+        np.testing.assert_allclose(target_output, source_output, rtol = 1e-6, atol = 1e-7)
+
+
+@pytest.mark.parametrize("network_index", range(6), ids = [
+    "actor", "critic_1", "critic_2", "target_actor", "target_critic_1", "target_critic_2"
+])
+def test_network_tensorflow_gradients_are_connected_and_finite(network_index):
+    import tensorflow as tf
+
+    assert keras.backend.backend() == "tensorflow"
+    spec = _environment_spec(4, 2)
+    config = MLPConfig(hidden_units = [8, 4], hidden_activations = ["tanh", "swish"])
+    main, targets = _build_six_networks(spec, config, config)
+    model = (main + targets)[network_index]
+    kind = "actor" if network_index in (0, 3) else "critic"
+    inputs = _network_inputs(spec, kind)
+    inputs = [tf.convert_to_tensor(x) for x in inputs] if isinstance(inputs, list) else tf.convert_to_tensor(inputs)
+    # A scalar reduction is sufficient to check autodiff connectivity; no TD3 loss.
+    with tf.GradientTape() as tape:
+        output = model(inputs, training = True)
+        scalar = tf.reduce_sum(output)
+    variables = model.trainable_variables
+    assert variables
+    gradients = tape.gradient(scalar, variables)
+    assert len(gradients) == len(variables)
+    for gradient, variable in zip(gradients, variables, strict = True):
+        assert gradient is not None, f"Disconnected gradient: {variable.name}"
+        assert gradient.shape == variable.shape
+        assert bool(tf.reduce_all(tf.math.is_finite(gradient)).numpy())
