@@ -94,3 +94,17 @@ def build_critic(spec: "EnvironmentSpec", config: MLPConfig) -> keras.Model:
     return keras.Model(
         inputs = [observation, action], outputs = q_value, name = "critic"
     )
+
+
+def create_target_network(model: keras.Model) -> keras.Model:
+    """Create an independent target network with the main network's weights.
+
+    Only the initial full synchronization is performed here. Subsequent
+    soft updates belong to TD3Agent.
+
+    :param model: built Keras Actor or Critic to clone.
+    :return: independent Keras model with identical initial weight values.
+    """
+    target_model = keras.models.clone_model(model)
+    target_model.set_weights(model.get_weights())
+    return target_model
