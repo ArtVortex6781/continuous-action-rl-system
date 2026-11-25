@@ -28,3 +28,19 @@ class EnvironmentDependencyError(EnvironmentSystemError):
 
 class EnvironmentCreationError(EnvironmentSystemError):
     """Ошибка создания Gymnasium-среды."""
+
+
+class AgentSystemError(RLSystemError):
+    """Базовая ошибка подсистемы Agent."""
+
+
+class AgentInputError(AgentSystemError):
+    """Нарушение входного контракта агента."""
+
+
+class AgentUpdateError(AgentSystemError):
+    """Нарушение структурного или вычислительного контракта обновления."""
+
+
+class AgentNumericalError(AgentSystemError):
+    """Неконечное значение внутренних вычислений или состояния агента."""
