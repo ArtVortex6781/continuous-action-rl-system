@@ -14,7 +14,12 @@ from rl_system.agents.td3.networks import (
     create_target_network,
 )
 from rl_system.agents.td3.replay_buffer import ReplayBuffer
-from rl_system.exceptions import AgentInputError, UnsupportedSpaceError
+from rl_system.exceptions import (
+    AgentInputError,
+    AgentNumericalError,
+    AgentUpdateError,
+    UnsupportedSpaceError,
+)
 
 if TYPE_CHECKING:
     from rl_system.environment import EnvironmentSpec
@@ -136,6 +141,27 @@ class TD3Agent(OffPolicyAgent):
         self._action_low = low32
         self._action_high = high32
 
+    def _scale_action(self, action: tf.Tensor) -> tf.Tensor:
+        """Map normalized actions to the environment's action units.
+
+        :param action: normalized action tensor with action_dim on its last axis.
+        :return: scaled action tensor, preserving the gradient path.
+        """
+        return self._action_midpoint + self._action_half_range * action
+
+    @staticmethod
+    def _assert_finite(value: tf.Tensor, name: str) -> None:
+        """Reject nonfinite internal computation results.
+
+        :param value: tensor to check.
+        :param name: operation or value name used in the error message.
+        :raises AgentNumericalError: if the tensor contains NaN or infinity.
+        """
+        try:
+            tf.debugging.assert_all_finite(value, f"{name} must be finite")
+        except tf.errors.InvalidArgumentError as exc:
+            raise AgentNumericalError(f"Nonfinite values in {name}") from exc
+
     def select_action(
             self, observation: np.ndarray, *, explore: bool
     ) -> np.ndarray:
@@ -143,10 +169,59 @@ class TD3Agent(OffPolicyAgent):
 
         :param observation: current observation vector.
         :param explore: whether to apply exploration noise.
-        :return: action vector in the environment's actual action range.
-        :raises NotImplementedError: until step 2/5 is implemented.
+        :return: finite float32 action vector in the original action bounds.
+        :raises AgentInputError: if observation or explore is invalid.
+        :raises AgentUpdateError: if the Actor output has an unexpected shape.
+        :raises AgentNumericalError: if action computation produces nonfinite values.
         """
-        raise NotImplementedError("Action selection is not implemented yet")
+        if not isinstance(explore, (bool, np.bool_)):
+            raise AgentInputError("explore must be a boolean")
+
+        try:
+            obs = np.asarray(observation)
+            if obs.shape != (self._spec.observation_dim,):
+                raise ValueError(
+                    f"observation must have shape ({self._spec.observation_dim},), "
+                    f"got {obs.shape}"
+                )
+            if obs.dtype.kind not in ("i", "u", "f"):
+                raise TypeError("observation must contain real numeric values")
+            with np.errstate(over = "ignore", invalid = "ignore"):
+                obs = obs.astype(np.float32)
+            if not np.all(np.isfinite(obs)):
+                raise ValueError("observation must contain finite float32 values")
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise AgentInputError(f"Invalid observation: {exc}") from exc
+
+        obs_batch = tf.convert_to_tensor(obs[None, :], dtype = tf.float32)
+        normalized = self._actor(obs_batch, training = False)
+        if normalized.shape != (1, self._spec.action_dim):
+            raise AgentUpdateError(
+                f"Actor output must have shape (1, {self._spec.action_dim}), "
+                f"got {normalized.shape}"
+            )
+        self._assert_finite(normalized, "Actor output")
+
+        if explore:
+            with np.errstate(over = "ignore", invalid = "ignore"):
+                noise = self._exploration_rng.normal(
+                    loc = 0.0,
+                    scale = self._config.exploration_noise_std,
+                    size = (1, self._spec.action_dim),
+                )
+                noisy_action = normalized.numpy() + noise
+            if not np.all(np.isfinite(noisy_action)):
+                raise AgentNumericalError("Nonfinite values in exploration action")
+            normalized = tf.convert_to_tensor(
+                np.clip(noisy_action, -1.0, 1.0), dtype = tf.float32
+            )
+        else:
+            normalized = tf.clip_by_value(normalized, -1.0, 1.0)
+
+        scaled = self._scale_action(normalized)
+        self._assert_finite(scaled, "Scaled action")
+        # Only the external action is rounded/clipped to the inward float32 bounds.
+        return np.clip(scaled.numpy()[0], self._action_low, self._action_high)
 
     def store_transition(
             self,
@@ -165,9 +240,31 @@ class TD3Agent(OffPolicyAgent):
         :param next_obs: observation returned by the environment step.
         :param terminated: whether the environment reached a terminal state.
         :param truncated: whether the episode was truncated.
-        :raises NotImplementedError: until step 2/5 is implemented.
+        :raises AgentInputError: if the transition violates the input contract.
         """
-        raise NotImplementedError("Transition storage is not implemented yet")
+        try:
+            action_array = np.asarray(action)
+        except (TypeError, ValueError) as exc:
+            raise AgentInputError(f"Invalid transition action: {exc}") from exc
+
+        # Shape, dtype and finiteness validation belong to ReplayBuffer.
+        # Only compare bounds when the input supports a coordinatewise comparison.
+        if (
+                action_array.shape == (self._spec.action_dim,)
+                and action_array.dtype.kind in ("i", "u", "f")
+                and (
+                np.any(action_array < self._spec.action_low)
+                or np.any(action_array > self._spec.action_high)
+        )
+        ):
+            raise AgentInputError("Transition action is outside the environment bounds")
+
+        try:
+            self._replay_buffer.add(
+                obs, action_array, reward, next_obs, terminated, truncated
+            )
+        except (TypeError, ValueError) as exc:
+            raise AgentInputError(f"Invalid transition: {exc}") from exc
 
     def update(self) -> dict[str, float] | None:
         """Perform a TD3 update if sufficient experience is available.
