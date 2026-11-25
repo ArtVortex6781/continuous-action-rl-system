@@ -185,6 +185,8 @@ def test_run_config_rejects_wrong_nested_types(valid_data):
         RunConfig.model_validate(valid_data)
 
 
+# Step 3/3: YAML loader and public load_config() contract.
+
 VALID_YAML = """\
 environment:
   id: Pendulum-v1
@@ -201,8 +203,12 @@ training:
 
 
 def test_load_project_example_yaml(valid_data):
-    project_root = Path(__file__).resolve().parents[2]
-    config = load_config(project_root / "configs" / "td3_pendulum.yaml")
+    project_root = Path(__file__).resolve().parents[3]
+    config_path = project_root / "configs" / "td3_pendulum.yaml"
+    config = load_config(config_path)
+    valid_data["algorithm"]["params"] = yaml.safe_load(
+        config_path.read_text(encoding = "utf-8")
+    )["algorithm"]["params"]
 
     assert isinstance(config, RunConfig)
     assert config.model_dump(mode = "json") == valid_data
@@ -223,11 +229,11 @@ def test_load_config_accepts_path_and_string(tmp_path, valid_data, use_str_path)
 @pytest.mark.parametrize(
     "content",
     [
-        "",
-        "# only a comment\n",
-        "[]\n",
+        "",  # Empty YAML file.
+        "# only a comment\n",  # YAML parsing yields None.
+        "[]\n",  # Invalid root type.
         VALID_YAML.replace("  seed: 42", "  seed: true"),
-        VALID_YAML + "unexpected: 1\n",
+        VALID_YAML + "unexpected: 1\n",  # Unknown top-level field.
     ],
 )
 def test_load_config_rejects_invalid_schema(tmp_path, content):

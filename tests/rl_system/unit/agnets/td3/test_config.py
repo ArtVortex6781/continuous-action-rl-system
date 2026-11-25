@@ -339,7 +339,7 @@ def test_td3_model_validate_reports_pydantic_error_without_project_wrapper():
 
 
 def test_example_yaml_loads_through_general_and_td3_specific_configuration():
-    project_root = Path(__file__).resolve().parents[4]
+    project_root = Path(__file__).resolve().parents[5]
     run_config = load_config(project_root / "configs" / "td3_pendulum.yaml")
 
     assert isinstance(run_config, RunConfig)
@@ -359,7 +359,7 @@ def test_example_yaml_loads_through_general_and_td3_specific_configuration():
 
 
 def test_td3_validation_does_not_modify_general_config_params():
-    project_root = Path(__file__).resolve().parents[4]
+    project_root = Path(__file__).resolve().parents[5]
     run_config = load_config(project_root / "configs" / "td3_pendulum.yaml")
     original_params = deepcopy(run_config.algorithm.params)
 
