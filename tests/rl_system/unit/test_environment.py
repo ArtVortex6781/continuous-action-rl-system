@@ -47,8 +47,8 @@ def _spec(**overrides):
     values = {
         "observation_dim": 3,
         "action_dim": 2,
-        "action_low": np.array([-2.0, 0.5], dtype = np.float64),
-        "action_high": np.array([1.0, 4.5], dtype = np.float64),
+        "action_low": np.array([-2.0, 0.5], dtype = np.float32),
+        "action_high": np.array([1.0, 4.5], dtype = np.float32),
     }
     values.update(overrides)
     return EnvironmentSpec(**values)
@@ -67,23 +67,22 @@ def test_direct_spec_preserves_valid_dimensions_and_bounds():
     spec = _spec()
     assert spec.observation_dim == 3
     assert spec.action_dim == 2
-    assert spec.action_low.dtype == np.dtype("float64")
+    assert spec.action_low.dtype == np.dtype("float32")
     np.testing.assert_array_equal(spec.action_low, [-2.0, 0.5])
     np.testing.assert_array_equal(spec.action_high, [1.0, 4.5])
 
 
-def test_direct_spec_accepts_integer_bounds_without_dtype_coercion():
-    spec = _spec(
-        action_low = np.array([-2, 0], dtype = np.int64),
-        action_high = np.array([1, 5], dtype = np.int64),
-    )
-    assert spec.action_low.dtype == np.dtype("int64")
-    assert spec.action_high.dtype == np.dtype("int64")
+@pytest.mark.parametrize("field", ["action_low", "action_high"])
+@pytest.mark.parametrize("dtype", [np.float16, np.float64, np.int32, np.int64, np.uint32])
+def test_direct_spec_rejects_non_float32_bounds(field, dtype):
+    bounds = np.array([1, 2], dtype = dtype)
+    with pytest.raises(ValueError, match = f"{field}.*dtype float32"):
+        _spec(**{field: bounds})
 
 
 def test_direct_spec_copies_bounds_and_blocks_ordinary_mutation():
-    source_low = np.array([-2.0, 0.5])
-    source_high = np.array([1.0, 4.5])
+    source_low = np.array([-2.0, 0.5], dtype = np.float32)
+    source_high = np.array([1.0, 4.5], dtype = np.float32)
     spec = _spec(action_low = source_low, action_high = source_high)
 
     assert not np.shares_memory(source_low, spec.action_low)
@@ -133,10 +132,10 @@ def test_direct_spec_rejects_invalid_dimensions(field, invalid):
 @pytest.mark.parametrize(
     ("field", "invalid"),
     [
-        ("action_low", np.array([-2.0])),
-        ("action_high", np.array([[1.0, 4.5]])),
-        ("action_low", np.array([-np.inf, 0.5])),
-        ("action_high", np.array([1.0, np.nan])),
+        ("action_low", np.array([-2.0], dtype = np.float32)),
+        ("action_high", np.array([[1.0, 4.5]], dtype = np.float32)),
+        ("action_low", np.array([-np.inf, 0.5], dtype = np.float32)),
+        ("action_high", np.array([1.0, np.nan], dtype = np.float32)),
         ("action_low", np.array([False, True])),
         ("action_high", np.array([1 + 0j, 4 + 0j])),
         ("action_low", np.array(["-2", "0.5"])),
@@ -156,21 +155,37 @@ def test_direct_spec_rejects_invalid_bound_arrays(field, invalid):
 )
 def test_direct_spec_rejects_unordered_bounds(low, high):
     with pytest.raises(ValueError, match = "low < high"):
-        _spec(action_low = np.array(low), action_high = np.array(high))
+        _spec(action_low = np.array(low, dtype = np.float32), action_high = np.array(high, dtype = np.float32))
 
 
 @pytest.mark.parametrize("observation_dtype", [np.float32, np.float64, np.int32])
-@pytest.mark.parametrize("action_dtype", [np.float32, np.float64])
-def test_extract_supports_numeric_vector_boxes(observation_dtype, action_dtype):
+def test_extract_supports_numeric_vector_boxes(observation_dtype):
     env = _env(
         observation_space = _box(shape = (4,), dtype = observation_dtype),
-        action_space = _box(shape = (2,), low = -2.0, high = 3.0, dtype = action_dtype),
+        action_space = _box(shape = (2,), low = -2.0, high = 3.0, dtype = np.float32),
     )
     spec = extract_environment_spec(env)
     assert (spec.observation_dim, spec.action_dim) == (4, 2)
     np.testing.assert_array_equal(spec.action_low, [-2.0, -2.0])
     np.testing.assert_array_equal(spec.action_high, [3.0, 3.0])
-    assert spec.action_low.dtype == np.dtype(action_dtype)
+    assert spec.action_low.dtype == np.dtype(np.float32)
+    assert spec.action_high.dtype == np.dtype(np.float32)
+
+
+@pytest.mark.parametrize("dtype", [np.float16, np.float64, np.int32, np.int64, np.uint32])
+def test_extract_rejects_non_float32_action_boxes(dtype):
+    env = _env(action_space = _box(shape = (2,), low = 0, high = 3, dtype = dtype))
+    with pytest.raises(UnsupportedSpaceError, match = "action_space.*dtype float32"):
+        extract_environment_spec(env)
+
+
+@pytest.mark.parametrize("bound_name", ["low", "high"])
+def test_extract_rejects_non_float32_action_bound_arrays(bound_name):
+    env = _env(action_space = _box(shape = (2,)))
+    setattr(env.action_space, bound_name, getattr(env.action_space, bound_name).astype(np.float64))
+    with pytest.raises(UnsupportedSpaceError, match = "action_space bounds.*dtype float32") as error:
+        extract_environment_spec(env)
+    assert isinstance(error.value.__cause__, ValueError)
 
 
 def test_extract_allows_infinite_observation_bounds_and_asymmetric_actions():
@@ -178,9 +193,9 @@ def test_extract_allows_infinite_observation_bounds_and_asymmetric_actions():
         observation_space = _box(shape = (3,), low = -np.inf, high = np.inf),
         action_space = _box(
             shape = (2,),
-            low = np.array([-3.0, 0.5]),
-            high = np.array([1.0, 8.0]),
-            dtype = np.float64,
+            low = np.array([-3.0, 0.5], dtype = np.float32),
+            high = np.array([1.0, 8.0], dtype = np.float32),
+            dtype = np.float32,
         ),
     )
     spec = extract_environment_spec(env)
@@ -249,7 +264,6 @@ def test_extract_rejects_empty_box_vector(space_name):
         ("observation_space", np.bool_),
         ("observation_space", np.complex64),
         ("observation_space", object),
-        ("action_space", np.int32),
         ("action_space", np.bool_),
         ("action_space", np.complex64),
     ],
