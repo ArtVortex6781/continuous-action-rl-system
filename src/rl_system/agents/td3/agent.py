@@ -414,33 +414,57 @@ class TD3Agent(OffPolicyAgent):
             self,
             source: keras.Model,
             target: keras.Model,
-            *,
-            name: str,
     ) -> None:
         """Move target weights toward their corresponding source weights.
 
         :param source: main network whose weights remain unchanged.
         :param target: corresponding target network to update.
-        :param name: target network identifier for error messages.
-        :raises AgentNumericalError: if an updated target weight is nonfinite.
         """
         tau = self._config.tau
         for source_weight, target_weight in zip(source.weights, target.weights, strict = True):
             target_weight.assign((1.0 - tau) * target_weight + tau * source_weight)
 
     def _update_target_networks(self) -> None:
-        """Soft-update all three target networks after a successful Actor update.
-
-        :raises AgentNumericalError: if an updated target weight is nonfinite.
-        """
-        self._soft_update(self._actor, self._target_actor, name = "Target Actor")
-        self._soft_update(self._critic_1, self._target_critic_1, name = "Target Critic 1")
-        self._soft_update(self._critic_2, self._target_critic_2, name = "Target Critic 2")
+        """Soft-update all three target networks after a successful Actor update."""
+        self._soft_update(self._actor, self._target_actor)
+        self._soft_update(self._critic_1, self._target_critic_1)
+        self._soft_update(self._critic_2, self._target_critic_2)
 
     def update(self) -> dict[str, float] | None:
         """Perform a TD3 update if sufficient experience is available.
 
-        :return: update metrics or None if the replay buffer is not ready.
-        :raises NotImplementedError: until step 4/4 is implemented.
+        Sample one batch, update both Critics, and update the Actor and target
+        networks when the number of successful Critic pairs reaches a multiple
+        of policy_delay. Insufficient experience leaves all state unchanged.
+        Failed updates are fatal and are not rolled back.
+
+        :return: Critic losses and, on delayed updates, Actor loss as Python
+            floats, or None if the replay buffer is not ready.
+        :raises AgentUpdateError: if a required gradient is missing.
+        :raises AgentNumericalError: if a checked computation or optimizer
+            state is nonfinite.
         """
-        raise NotImplementedError("TD3 update is not implemented yet")
+        if len(self._replay_buffer) < self._config.batch_size:
+            return None
+
+        batch = self._replay_buffer.sample(self._config.batch_size)
+        obs = tf.convert_to_tensor(batch.obs, dtype = tf.float32)
+        actions = tf.convert_to_tensor(batch.actions, dtype = tf.float32)
+        rewards = tf.convert_to_tensor(batch.rewards, dtype = tf.float32)
+        next_obs = tf.convert_to_tensor(batch.next_obs, dtype = tf.float32)
+        terminated = tf.convert_to_tensor(batch.terminated, dtype = tf.float32)
+
+        target = self._compute_bellman_target(next_obs, rewards, terminated)
+        loss_1, loss_2 = self._update_critics(obs, actions, target)
+        self._update_count += 1
+
+        metrics = {
+            "critic_1_loss": float(loss_1.numpy()),
+            "critic_2_loss": float(loss_2.numpy()),
+        }
+        if self._update_count % self._config.policy_delay == 0:
+            actor_loss = self._update_actor(obs)
+            self._update_target_networks()
+            metrics["actor_loss"] = float(actor_loss.numpy())
+
+        return metrics
