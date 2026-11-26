@@ -384,6 +384,59 @@ class TD3Agent(OffPolicyAgent):
         )
         return loss_1, loss_2
 
+    def _update_actor(self, obs: tf.Tensor) -> tf.Tensor:
+        """Update the main Actor using the first main Critic.
+
+        :param obs: observations from the same batch used for Critic updates.
+        :return: scalar Actor loss used for optimization.
+        :raises AgentUpdateError: if a gradient is missing.
+        :raises AgentNumericalError: if an internal result or updated state
+            is nonfinite.
+        """
+        with tf.GradientTape() as tape:
+            normalized = self._actor(obs, training = True)
+            self._assert_finite(normalized, "Actor output")
+            actions = self._scale_action(normalized)
+            q = self._critic_1([obs, actions], training = False)
+            loss = -tf.reduce_mean(q)
+        self._assert_finite(loss, "Actor loss")
+
+        variables = self._actor.trainable_variables
+        gradients = tape.gradient(loss, variables)
+        self._validate_gradients(gradients, variables, name = "Actor")
+        self._actor_optimizer.apply_gradients(zip(gradients, variables, strict = True))
+        self._validate_optimization_state(
+            self._actor, self._actor_optimizer, name = "Actor"
+        )
+        return loss
+
+    def _soft_update(
+            self,
+            source: keras.Model,
+            target: keras.Model,
+            *,
+            name: str,
+    ) -> None:
+        """Move target weights toward their corresponding source weights.
+
+        :param source: main network whose weights remain unchanged.
+        :param target: corresponding target network to update.
+        :param name: target network identifier for error messages.
+        :raises AgentNumericalError: if an updated target weight is nonfinite.
+        """
+        tau = self._config.tau
+        for source_weight, target_weight in zip(source.weights, target.weights, strict = True):
+            target_weight.assign((1.0 - tau) * target_weight + tau * source_weight)
+
+    def _update_target_networks(self) -> None:
+        """Soft-update all three target networks after a successful Actor update.
+
+        :raises AgentNumericalError: if an updated target weight is nonfinite.
+        """
+        self._soft_update(self._actor, self._target_actor, name = "Target Actor")
+        self._soft_update(self._critic_1, self._target_critic_1, name = "Target Critic 1")
+        self._soft_update(self._critic_2, self._target_critic_2, name = "Target Critic 2")
+
     def update(self) -> dict[str, float] | None:
         """Perform a TD3 update if sufficient experience is available.
 
