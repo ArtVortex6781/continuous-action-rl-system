@@ -1,5 +1,6 @@
 """Unit and YAML-integration tests for TD3-specific Pydantic configuration."""
 
+import math
 from copy import deepcopy
 from pathlib import Path
 
@@ -218,25 +219,22 @@ def test_td3_rejects_nonfinite_numbers(field, bad_value):
         TD3Config.model_validate(params)
 
 
+NUMERIC_RANGES = (
+    ("gamma", 0.0, 0.999999),
+    ("tau", 1e-6, 1.0),
+    ("actor_learning_rate", 1e-8, 1.0),
+    ("critic_learning_rate", 1e-8, 1.0),
+    ("exploration_noise_std", 0.0, 1.0),
+    ("target_policy_noise_std", 0.0, 1.0),
+    ("target_noise_clip", 0.0, 1.0),
+    ("actor_output_init_limit", 1e-8, 0.1),
+)
+
+
 @pytest.mark.parametrize(
     ("field", "bad_value"),
-    [
-        ("gamma", -0.001),
-        ("gamma", 1.0),
-        ("gamma", 1.5),
-        ("tau", 0.0),
-        ("tau", -0.1),
-        ("tau", 1.001),
-        ("actor_learning_rate", 0.0),
-        ("actor_learning_rate", -0.01),
-        ("critic_learning_rate", 0.0),
-        ("critic_learning_rate", -0.01),
-        ("exploration_noise_std", -0.01),
-        ("target_policy_noise_std", -0.01),
-        ("target_noise_clip", -0.01),
-        ("actor_output_init_limit", 0.0),
-        ("actor_output_init_limit", -0.003),
-    ],
+    [(field, math.nextafter(low, -math.inf)) for field, low, high in NUMERIC_RANGES]
+    + [(field, math.nextafter(high, math.inf)) for field, low, high in NUMERIC_RANGES],
 )
 def test_td3_rejects_numeric_values_outside_allowed_ranges(field, bad_value):
     params = _valid_td3_params()
@@ -245,30 +243,23 @@ def test_td3_rejects_numeric_values_outside_allowed_ranges(field, bad_value):
         TD3Config.model_validate(params)
 
 
-def test_td3_accepts_approved_numeric_boundaries():
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [(field, low) for field, low, high in NUMERIC_RANGES]
+    + [(field, high) for field, low, high in NUMERIC_RANGES],
+)
+def test_td3_accepts_approved_numeric_boundaries(field, value):
     params = _valid_td3_params()
-    params.update(
-        replay_capacity = 1,
-        batch_size = 1,
-        gamma = 0.0,
-        tau = 1.0,
-        actor_learning_rate = 1e-8,
-        critic_learning_rate = 1e-8,
-        policy_delay = 1,
-        exploration_noise_std = 0.0,
-        target_policy_noise_std = 0.0,
-        target_noise_clip = 0.0,
-        actor_output_init_limit = 1e-8,
-    )
+    params[field] = value
     config = TD3Config.model_validate(params)
+    assert getattr(config, field) == value
 
-    assert config.replay_capacity == config.batch_size == 1
-    assert config.gamma == 0.0
-    assert config.tau == 1.0
-    assert config.policy_delay == 1
-    assert config.exploration_noise_std == 0.0
-    assert config.target_policy_noise_std == 0.0
-    assert config.target_noise_clip == 0.0
+
+def test_td3_accepts_minimum_integer_fields():
+    params = _valid_td3_params()
+    params.update(replay_capacity = 1, batch_size = 1, policy_delay = 1)
+    config = TD3Config.model_validate(params)
+    assert config.replay_capacity == config.batch_size == config.policy_delay == 1
 
 
 @pytest.mark.parametrize("capacity,batch", [(1, 2), (255, 256), (2, 3)])
