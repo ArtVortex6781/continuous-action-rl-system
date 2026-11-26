@@ -85,80 +85,62 @@ class TD3Agent(OffPolicyAgent):
         self._update_count = 0
 
     def _initialize_action_scaling(self) -> None:
-        """Prepare affine scaling and inward-rounded float32 action bounds.
+        """Prepare float32 affine scaling constants and action bounds.
 
-        :raises UnsupportedSpaceError: if finite, nondegenerate action ranges
-            cannot be represented by the float32 scaling computation.
+        :raises UnsupportedSpaceError: if scaling cannot retain a finite,
+            nondegenerate action range in float32.
         """
-        low = self._spec.action_low.astype(np.longdouble)
-        high = self._spec.action_high.astype(np.longdouble)
+        low = self._spec.action_low
+        high = self._spec.action_high
+        low64 = low.astype(np.float64)
+        high64 = high.astype(np.float64)
+        midpoint = ((high64 + low64) / 2.0).astype(np.float32)
+        half_range = ((high64 - low64) / 2.0).astype(np.float32)
 
-        # Halve before adding/subtracting to avoid intermediate overflow.
-        with np.errstate(over = "ignore", under = "ignore", invalid = "ignore"):
-            low32 = low.astype(np.float32)
-            high32 = high.astype(np.float32)
-            midpoint = (high * 0.5 + low * 0.5).astype(np.float32)
-            half_range = (high * 0.5 - low * 0.5).astype(np.float32)
-
-        if not all(np.all(np.isfinite(array)) for array in (
-                low32, high32, midpoint, half_range
-        )) or np.any(half_range <= 0):
-            raise UnsupportedSpaceError(
-                "Action bounds and scaling must be finite with positive float32 ranges"
-            )
-
-        # Round inward so a returned float32 action cannot exceed the original bounds.
-        with np.errstate(over = "ignore", under = "ignore", invalid = "ignore"):
-            low32 = np.where(
-                low32.astype(np.longdouble) < low,
-                np.nextafter(low32, np.float32(np.inf)),
-                low32,
-            )
-            high32 = np.where(
-                high32.astype(np.longdouble) > high,
-                np.nextafter(high32, np.float32(-np.inf)),
-                high32,
-            )
-        if np.any(low32 >= high32):
-            raise UnsupportedSpaceError(
-                "Action bounds must contain a nonzero float32 interval"
-            )
+        if np.any(half_range <= 0):
+            raise UnsupportedSpaceError("Action scaling requires a positive float32 half range")
 
         self._action_midpoint = tf.convert_to_tensor(midpoint, dtype = tf.float32)
         self._action_half_range = tf.convert_to_tensor(half_range, dtype = tf.float32)
-        scaled_low = (self._action_midpoint - self._action_half_range).numpy()
-        scaled_high = (self._action_midpoint + self._action_half_range).numpy()
-        if (
-                not np.all(np.isfinite(scaled_low))
-                or not np.all(np.isfinite(scaled_high))
-                or np.any(scaled_low >= scaled_high)
-                or np.any(np.clip(scaled_low, low32, high32) >= np.clip(scaled_high, low32, high32))
-        ):
-            raise UnsupportedSpaceError(
-                "Action scaling must retain a finite nonzero range in float32"
-            )
+        self._action_low = tf.convert_to_tensor(low, dtype = tf.float32)
+        self._action_high = tf.convert_to_tensor(high, dtype = tf.float32)
 
-        self._action_low = low32
-        self._action_high = high32
+        scaled_low = self._action_midpoint - self._action_half_range
+        scaled_high = self._action_midpoint + self._action_half_range
+        if (
+                not np.all(np.isfinite(scaled_low.numpy()))
+                or not np.all(np.isfinite(scaled_high.numpy()))
+        ):
+            raise UnsupportedSpaceError("Action scaling endpoints must be finite in float32")
+
+        clipped_low = tf.clip_by_value(scaled_low, self._action_low, self._action_high)
+        clipped_high = tf.clip_by_value(scaled_high, self._action_low, self._action_high)
+        if np.any(clipped_low.numpy() >= clipped_high.numpy()):
+            raise UnsupportedSpaceError("Action scaling must retain a nonzero float32 range")
 
     def _scale_action(self, action: tf.Tensor) -> tf.Tensor:
-        """Map normalized actions to the environment's action units.
+        """Map normalized actions to the environment's action units with clipping.
 
         :param action: normalized action tensor with action_dim on its last axis.
         :return: scaled action tensor, preserving the gradient path.
         """
-        return self._action_midpoint + self._action_half_range * action
+        return tf.clip_by_value(
+            self._action_midpoint + self._action_half_range * action,
+            self._action_low,
+            self._action_high,
+        )
 
     @staticmethod
-    def _assert_finite(value: tf.Tensor, name: str) -> None:
+    def _assert_finite(value: tf.Tensor, name: str) -> tf.Tensor:
         """Reject nonfinite internal computation results.
 
         :param value: tensor to check.
         :param name: operation or value name used in the error message.
+        :return: checked tensor.
         :raises AgentNumericalError: if the tensor contains NaN or infinity.
         """
         try:
-            tf.debugging.assert_all_finite(value, f"{name} must be finite")
+            return tf.debugging.assert_all_finite(value, f"{name} must be finite")
         except tf.errors.InvalidArgumentError as exc:
             raise AgentNumericalError(f"Nonfinite values in {name}") from exc
 
@@ -171,7 +153,6 @@ class TD3Agent(OffPolicyAgent):
         :param explore: whether to apply exploration noise.
         :return: finite float32 action vector in the original action bounds.
         :raises AgentInputError: if observation or explore is invalid.
-        :raises AgentUpdateError: if the Actor output has an unexpected shape.
         :raises AgentNumericalError: if action computation produces nonfinite values.
         """
         if not isinstance(explore, (bool, np.bool_)):
@@ -195,33 +176,20 @@ class TD3Agent(OffPolicyAgent):
 
         obs_batch = tf.convert_to_tensor(obs[None, :], dtype = tf.float32)
         normalized = self._actor(obs_batch, training = False)
-        if normalized.shape != (1, self._spec.action_dim):
-            raise AgentUpdateError(
-                f"Actor output must have shape (1, {self._spec.action_dim}), "
-                f"got {normalized.shape}"
-            )
-        self._assert_finite(normalized, "Actor output")
-
         if explore:
             with np.errstate(over = "ignore", invalid = "ignore"):
                 noise = self._exploration_rng.normal(
                     loc = 0.0,
                     scale = self._config.exploration_noise_std,
                     size = (1, self._spec.action_dim),
-                )
-                noisy_action = normalized.numpy() + noise
-            if not np.all(np.isfinite(noisy_action)):
-                raise AgentNumericalError("Nonfinite values in exploration action")
-            normalized = tf.convert_to_tensor(
-                np.clip(noisy_action, -1.0, 1.0), dtype = tf.float32
-            )
+                ).astype(np.float32)
+            noise = tf.convert_to_tensor(noise, dtype = tf.float32)
+            noisy_action = self._assert_finite(normalized + noise, "Exploration action")
+            normalized = tf.clip_by_value(noisy_action, -1.0, 1.0)
         else:
-            normalized = tf.clip_by_value(normalized, -1.0, 1.0)
+            normalized = self._assert_finite(normalized, "Actor output")
 
-        scaled = self._scale_action(normalized)
-        self._assert_finite(scaled, "Scaled action")
-        # Only the external action is rounded/clipped to the inward float32 bounds.
-        return np.clip(scaled.numpy()[0], self._action_low, self._action_high)
+        return self._scale_action(normalized).numpy()[0]
 
     def store_transition(
             self,
@@ -266,10 +234,160 @@ class TD3Agent(OffPolicyAgent):
         except (TypeError, ValueError) as exc:
             raise AgentInputError(f"Invalid transition: {exc}") from exc
 
+    def _compute_bellman_target(
+            self,
+            next_obs: tf.Tensor,
+            rewards: tf.Tensor,
+            terminated: tf.Tensor,
+    ) -> tf.Tensor:
+        """Compute the shared, detached TD3 Bellman target for both Critics.
+
+        :param next_obs: float32 next observations of shape (batch, observation_dim).
+        :param rewards: float32 rewards of shape (batch, 1).
+        :param terminated: float32 terminal flags (0 or 1) of shape (batch, 1).
+        :return: detached float32 Bellman targets of shape (batch, 1).
+        :raises AgentNumericalError: if an internal result is nonfinite.
+        """
+        action_shape = (next_obs.shape[0], self._spec.action_dim)
+        normalized = self._target_actor(next_obs, training = False)
+
+        with np.errstate(over = "ignore", invalid = "ignore"):
+            noise = self._target_noise_rng.normal(
+                loc = 0.0,
+                scale = self._config.target_policy_noise_std,
+                size = action_shape,
+            ).astype(np.float32)
+        noise = tf.convert_to_tensor(noise, dtype = tf.float32)
+        noise = self._assert_finite(noise, "Target policy noise")
+
+        noise_clip = self._config.target_noise_clip
+        noise = tf.clip_by_value(noise, -noise_clip, noise_clip)
+        noisy_action = self._assert_finite(normalized + noise, "Noisy target action")
+        normalized = tf.clip_by_value(noisy_action, -1.0, 1.0)
+        target_action = self._scale_action(normalized)
+
+        q1 = self._target_critic_1([next_obs, target_action], training = False)
+        q2 = self._target_critic_2([next_obs, target_action], training = False)
+        q1 = self._assert_finite(q1, "Target Critic 1 output")
+        q2 = self._assert_finite(q2, "Target Critic 2 output")
+
+        target = rewards + self._config.gamma * (1.0 - terminated) * tf.minimum(q1, q2)
+        return tf.stop_gradient(self._assert_finite(target, "Bellman target"))
+
+    def _compute_critic_gradients(
+            self,
+            critic: keras.Model,
+            obs: tf.Tensor,
+            actions: tf.Tensor,
+            target: tf.Tensor,
+            *,
+            name: str,
+    ) -> tuple[tf.Tensor, list[tf.Tensor | None]]:
+        """Compute one Critic's MSE and gradients without applying an optimizer.
+
+        :param critic: main Critic to differentiate.
+        :param obs: batch of observations.
+        :param actions: actual actions sampled from the replay buffer.
+        :param target: detached Bellman targets of shape (batch, 1).
+        :param name: Critic identifier for error messages.
+        :return: scalar MSE and gradients in trainable-variable order.
+        :raises AgentNumericalError: if the loss is nonfinite.
+        """
+        with tf.GradientTape() as tape:
+            q = critic([obs, actions], training = True)
+            loss = tf.reduce_mean(tf.square(q - target))
+        self._assert_finite(loss, f"{name} loss")
+        gradients = tape.gradient(loss, critic.trainable_variables)
+        return loss, gradients
+
+    def _validate_gradients(
+            self,
+            gradients: list[tf.Tensor | None],
+            variables: list[keras.Variable],
+            *,
+            name: str,
+    ) -> None:
+        """Check gradient presence and finiteness before an optimizer update.
+
+        :param gradients: gradients in trainable-variable order.
+        :param variables: corresponding trainable variables.
+        :param name: network identifier for error messages.
+        :raises AgentUpdateError: if a gradient is missing.
+        :raises ValueError: if gradient and variable counts do not match.
+        :raises AgentNumericalError: if a gradient is nonfinite.
+        """
+        for gradient, variable in zip(gradients, variables, strict = True):
+            label = f"{name} gradient for {variable.path}"
+            if gradient is None:
+                raise AgentUpdateError(f"Missing {label}")
+            self._assert_finite(gradient, label)
+
+    def _validate_optimization_state(
+            self,
+            model: keras.Model,
+            optimizer: keras.optimizers.Optimizer,
+            *,
+            name: str,
+    ) -> None:
+        """Check model weights and floating-point optimizer state after an update.
+
+        :param model: updated main network.
+        :param optimizer: optimizer owning the corresponding update state.
+        :param name: network identifier for error messages.
+        :raises AgentNumericalError: if a checked variable is nonfinite.
+        """
+        for variable in model.weights:
+            self._assert_finite(tf.convert_to_tensor(variable), f"{name} weight {variable.path}")
+        for variable in optimizer.variables:
+            if tf.as_dtype(variable.dtype).is_floating:
+                self._assert_finite(
+                    tf.convert_to_tensor(variable), f"{name} Adam state {variable.path}"
+                )
+
+    def _update_critics(
+            self,
+            obs: tf.Tensor,
+            actions: tf.Tensor,
+            target: tf.Tensor,
+    ) -> tuple[tf.Tensor, tf.Tensor]:
+        """Update both main Critics against the same Bellman target.
+
+        Both losses and gradient sets are checked before either Adam is applied.
+        A failed post-update check is fatal; optimizer changes are not rolled back.
+
+        :param obs: batch of observations.
+        :param actions: actual actions sampled from the replay buffer.
+        :param target: detached Bellman targets.
+        :return: the two scalar losses used for optimization, in Critic order.
+        :raises AgentUpdateError: if a gradient is missing.
+        :raises AgentNumericalError: if a loss, gradient or updated state is nonfinite.
+        """
+        loss_1, gradients_1 = self._compute_critic_gradients(
+            self._critic_1, obs, actions, target, name = "Critic 1"
+        )
+        loss_2, gradients_2 = self._compute_critic_gradients(
+            self._critic_2, obs, actions, target, name = "Critic 2"
+        )
+
+        variables_1 = self._critic_1.trainable_variables
+        variables_2 = self._critic_2.trainable_variables
+        self._validate_gradients(gradients_1, variables_1, name = "Critic 1")
+        self._validate_gradients(gradients_2, variables_2, name = "Critic 2")
+
+        self._critic_1_optimizer.apply_gradients(zip(gradients_1, variables_1, strict = True))
+        self._validate_optimization_state(
+            self._critic_1, self._critic_1_optimizer, name = "Critic 1"
+        )
+        self._critic_2_optimizer.apply_gradients(zip(gradients_2, variables_2, strict = True))
+        self._validate_optimization_state(
+            self._critic_2, self._critic_2_optimizer, name = "Critic 2"
+        )
+        return loss_1, loss_2
+
     def update(self) -> dict[str, float] | None:
         """Perform a TD3 update if sufficient experience is available.
 
         :return: update metrics or None if the replay buffer is not ready.
-        :raises NotImplementedError: until step 5/5 is implemented.
+        :raises NotImplementedError: until step 4/4 is implemented.
         """
         raise NotImplementedError("TD3 update is not implemented yet")
