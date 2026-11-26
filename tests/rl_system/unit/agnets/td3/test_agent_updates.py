@@ -266,3 +266,163 @@ def test_nonfinite_post_update_state_is_fatal(agent, batch, monkeypatch, index, 
     assert int(agent._critic_1_optimizer.iterations.numpy()) == 1
     assert int(agent._critic_2_optimizer.iterations.numpy()) == (index == 2)
     assert agent._update_count == 0
+
+
+def test_actor_loss_and_gradient_through_scaling(agent, batch, monkeypatch):
+    obs, _, _ = batch
+    # Zero Actor parameters give u=(0, 0), hence actions=(1, 3).
+    _constant_output(agent._actor, 0.)
+    untouched = [*_main_critic_state(agent), *agent._target_actor.weights,
+                 *agent._target_critic_1.weights, *agent._target_critic_2.weights]
+    before = _snapshot(untouched)
+    # Q = 2*a_1 - 3*a_2 + s_1. At u=0, da/du=(3, 2).
+    # d(-mean(Q))/d(actor output bias)=(-6, 6), since tanh'(0)=1.
+    calls = []
+
+    def critic(inputs, *, training):
+        assert training is False
+        assert inputs[0] is obs
+        np.testing.assert_allclose(inputs[1].numpy(), [[1., 3.]] * 4)
+        calls.append(True)
+        return 2. * inputs[1][:, :1] - 3. * inputs[1][:, 1:] + obs[:, :1]
+
+    monkeypatch.setattr(agent, "_critic_1", critic)
+    original = agent._actor_optimizer.apply_gradients
+
+    def apply(pairs):
+        pairs = list(pairs)
+        for (gradient, variable), expected in zip(pairs, agent._actor.trainable_variables, strict = True):
+            assert variable is expected
+            assert gradient is not None
+        for gradient, _ in pairs[:-1]:
+            np.testing.assert_array_equal(gradient.numpy(), np.zeros(gradient.shape))
+        np.testing.assert_allclose(pairs[-1][0].numpy(), [-6., 6.], atol = 1e-6)
+        return original(pairs)
+
+    monkeypatch.setattr(agent._actor_optimizer, "apply_gradients", apply)
+    loss = agent._update_actor(obs)
+    assert loss.shape == ()
+    assert float(loss.numpy()) == pytest.approx(7. - np.mean(obs.numpy()[:, 0]))
+    assert len(calls) == 1
+    assert int(agent._actor_optimizer.iterations.numpy()) == 1
+    assert np.all(agent._actor.weights[-1].numpy() * np.array([1., -1.]) > 0)
+    _unchanged(untouched, before)
+    assert agent._update_count == 0
+
+
+def test_actor_uses_current_critic_after_critic_update(agent, batch):
+    obs, actions, target = batch
+    _constant_output(agent._actor, 0.)
+    _constant_output(agent._critic_1, 2.)
+    _constant_output(agent._critic_2, -1.)
+    old_q = agent._critic_1([obs, agent._scale_action(agent._actor(obs))], training = False)
+    agent._update_critics(obs, actions, target)
+    new_q = agent._critic_1([obs, agent._scale_action(agent._actor(obs))], training = False)
+    assert not np.array_equal(old_q.numpy(), new_q.numpy())
+    state = _main_critic_state(agent)
+    before = _snapshot(state)
+    loss = agent._update_actor(obs)
+    assert float(loss.numpy()) == pytest.approx(-float(tf.reduce_mean(new_q).numpy()))
+    _unchanged(state, before)
+
+
+def test_scaling_clips_and_preserves_interior_gradient(agent):
+    normalized = tf.Variable([[-2., 2.], [0., 0.], [2., -2.]], dtype = tf.float32)
+    with tf.GradientTape() as tape:
+        scaled = agent._scale_action(normalized)
+        loss = tf.reduce_sum(scaled)
+    np.testing.assert_allclose(scaled.numpy(), [[-2., 5.], [1., 3.], [4., 1.]])
+    np.testing.assert_allclose(tape.gradient(loss, normalized).numpy(),
+                               [[0., 0.], [3., 2.], [0., 0.]])
+
+
+@pytest.mark.parametrize("value", [np.nan, np.inf, -np.inf])
+@pytest.mark.parametrize("point", ["output", "loss"])
+def test_actor_nonfinite_forward_prevents_update(agent, batch, monkeypatch, point, value):
+    obs, _, _ = batch
+    state = [*agent._actor.weights, *agent._actor_optimizer.variables]
+    before = _snapshot(state)
+    if point == "output":
+        monkeypatch.setattr(agent, "_actor", lambda *a, **k: tf.fill((4, 2), tf.constant(value, tf.float32)))
+    else:
+        monkeypatch.setattr(agent, "_critic_1", lambda *a, **k: tf.fill((4, 1), tf.constant(value, tf.float32)))
+    with pytest.raises(AgentNumericalError, match = f"Actor {point}"):
+        agent._update_actor(obs)
+    _unchanged(state, before)
+
+
+@pytest.mark.parametrize("value", [None, np.nan, np.inf, -np.inf])
+def test_actor_invalid_gradient_prevents_update(agent, batch, monkeypatch, value):
+    obs, _, _ = batch
+    state = [*agent._actor.weights, *agent._actor_optimizer.variables]
+    before = _snapshot(state)
+    if value is None:
+        def critic(inputs, *, training):
+            return tf.stop_gradient(tf.reduce_sum(inputs[1], axis = 1, keepdims = True))
+    else:
+        @tf.custom_gradient
+        def bad_gradient(actions):
+            def backward(dy):
+                return tf.fill(tf.shape(actions), tf.constant(value, tf.float32))
+
+            return tf.reduce_sum(actions, axis = 1, keepdims = True), backward
+
+        def critic(inputs, *, training):
+            return bad_gradient(inputs[1])
+
+    monkeypatch.setattr(agent, "_critic_1", critic)
+    error = AgentUpdateError if value is None else AgentNumericalError
+    with pytest.raises(error, match = "Actor"):
+        agent._update_actor(obs)
+    _unchanged(state, before)
+
+
+@pytest.mark.parametrize("component", ["weight", "adam"])
+def test_actor_nonfinite_post_update_state_is_fatal(agent, batch, monkeypatch, component):
+    obs, _, _ = batch
+    optimizer = agent._actor_optimizer
+    original = optimizer.apply_gradients
+    untouched = [*_main_critic_state(agent), *agent._target_actor.weights,
+                 *agent._target_critic_1.weights, *agent._target_critic_2.weights]
+    before = _snapshot(untouched)
+
+    def apply(pairs):
+        result = original(pairs)
+        variable = agent._actor.weights[-1] if component == "weight" else optimizer.variables[-1]
+        variable.assign(tf.fill(variable.shape, tf.constant(np.inf, tf.float32)))
+        return result
+
+    monkeypatch.setattr(optimizer, "apply_gradients", apply)
+    with pytest.raises(AgentNumericalError, match = "Actor"):
+        agent._update_actor(obs)
+    assert int(optimizer.iterations.numpy()) == 1
+    _unchanged(untouched, before)
+
+
+@pytest.mark.parametrize("tau", [1e-6, 0.005, 0.25, 1.])
+def test_soft_updates_all_targets(agent, tau, monkeypatch):
+    monkeypatch.setattr(agent, "_config", agent._config.model_copy(update = {"tau": tau}))
+    pairs = [(agent._actor, agent._target_actor),
+             (agent._critic_1, agent._target_critic_1),
+             (agent._critic_2, agent._target_critic_2)]
+    expected = []
+    for index, (source, target) in enumerate(pairs, start = 1):
+        for j, (s, t) in enumerate(zip(source.weights, target.weights, strict = True)):
+            s.assign(tf.fill(s.shape, tf.constant(float(index + j), tf.float32)))
+            t.assign(tf.fill(t.shape, tf.constant(float(-index - j), tf.float32)))
+            assert s is not t
+        expected.append([(1. - tau) * t + tau * s for s, t in
+                         zip(_snapshot(source.weights), _snapshot(target.weights), strict = True)])
+    untouched = [v for source, _ in pairs for v in source.weights]
+    untouched += [*agent._actor_optimizer.variables, *agent._critic_1_optimizer.variables,
+                  *agent._critic_2_optimizer.variables]
+    before = _snapshot(untouched)
+    agent._update_target_networks()
+    for (source, target), values in zip(pairs, expected, strict = True):
+        for s, t, value in zip(source.weights, target.weights, values, strict = True):
+            np.testing.assert_allclose(t.numpy(), value, rtol = 1e-6, atol = 1e-7)
+            if tau == 1.:
+                np.testing.assert_array_equal(t.numpy(), s.numpy())
+            assert t is not s
+    _unchanged(untouched, before)
+    assert agent._update_count == 0
