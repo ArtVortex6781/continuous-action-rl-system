@@ -426,3 +426,236 @@ def test_soft_updates_all_targets(agent, tau, monkeypatch):
             assert t is not s
     _unchanged(untouched, before)
     assert agent._update_count == 0
+
+
+# Public update coordination.
+
+
+def _fill_replay(agent, count = 4):
+    for i in range(count):
+        obs = np.array([i + 1., 0.5, -0.25], dtype = np.float32)
+        action = np.array([1., 3.], dtype = np.float32)
+        agent.store_transition(obs, action, float(i + 1), obs + 0.5,
+                               i % 4 in (2, 3), i % 4 in (1, 3))
+
+
+def _target_state(agent):
+    return [*agent._target_actor.weights, *agent._target_critic_1.weights,
+            *agent._target_critic_2.weights]
+
+
+def _actor_state(agent):
+    return [*agent._actor.weights, *agent._actor_optimizer.variables]
+
+
+def _learning_state(agent):
+    return [*_main_critic_state(agent), *_actor_state(agent), *_target_state(agent)]
+
+
+def _rng_states(agent):
+    return [rng.bit_generator.state for rng in
+            (agent._replay_buffer._rng, agent._exploration_rng, agent._target_noise_rng)]
+
+
+def _replay_state(agent):
+    buffer = agent._replay_buffer
+    return (buffer.ptr, buffer.size, [getattr(buffer, name)[:buffer.size].copy()
+                                      for name in ('obs', 'actions', 'rewards', 'next_obs', 'terminated', 'truncated')])
+
+
+def _assert_replay_unchanged(agent, before):
+    after = _replay_state(agent)
+    assert after[:2] == before[:2]
+    for actual, expected in zip(after[2], before[2], strict = True):
+        np.testing.assert_array_equal(actual, expected)
+
+
+@pytest.mark.parametrize('count', [0, 3])
+def test_update_not_ready_is_noop(agent, monkeypatch, count):
+    _fill_replay(agent, count)
+    state = _learning_state(agent)
+    before = _snapshot(state)
+    rng_before = _rng_states(agent)
+    replay_before = _replay_state(agent)
+
+    def unexpected(*args, **kwargs):
+        pytest.fail('An unready update must not sample or compute')
+
+    monkeypatch.setattr(agent._replay_buffer, 'sample', unexpected)
+    monkeypatch.setattr(agent, '_compute_bellman_target', unexpected)
+    for _ in range(2):
+        assert agent.update() is None
+    assert agent._update_count == 0
+    _unchanged(state, before)
+    assert _rng_states(agent) == rng_before
+    _assert_replay_unchanged(agent, replay_before)
+
+
+@pytest.mark.parametrize('delay', [1, 2])
+def test_update_schedule_and_metrics(agent, monkeypatch, delay):
+    monkeypatch.setattr(agent, '_config', agent._config.model_copy(update = {'policy_delay': delay}))
+    _fill_replay(agent)  # Exactly batch_size: first update must be ready.
+    # Ensure the Critics have nonzero bias gradients on the first update.
+    for model in (agent._critic_1, agent._critic_2, agent._target_critic_1, agent._target_critic_2):
+        _constant_output(model, 0.)
+    original_sample = agent._replay_buffer.sample
+    original_target = agent._compute_bellman_target
+    original_critics = agent._update_critics
+    original_actor = agent._update_actor
+    original_targets = agent._update_target_networks
+    calls = []
+    captured = {}
+
+    def sample(size):
+        calls.append('sample')
+        assert size == agent._config.batch_size
+        captured['batch'] = original_sample(size)
+        return captured['batch']
+
+    def target(next_obs, rewards, terminated):
+        calls.append('target')
+        replay = captured['batch']
+        for tensor, expected in ((next_obs, replay.next_obs), (rewards, replay.rewards),
+                                 (terminated, replay.terminated.astype(np.float32))):
+            assert tensor.dtype == tf.float32
+            np.testing.assert_array_equal(tensor.numpy(), expected)
+        captured['target'] = original_target(next_obs, rewards, terminated)
+        return captured['target']
+
+    def critics(obs, actions, target):
+        calls.append('critics')
+        assert agent._update_count == step - 1
+        assert target is captured['target']
+        for tensor, expected in ((obs, captured['batch'].obs), (actions, captured['batch'].actions)):
+            assert tensor.dtype == tf.float32
+            np.testing.assert_array_equal(tensor.numpy(), expected)
+        captured['obs'] = obs
+        losses = original_critics(obs, actions, target)
+        captured['losses'] = {'critic_1_loss': float(losses[0].numpy()),
+                              'critic_2_loss': float(losses[1].numpy())}
+        return losses
+
+    def actor(obs):
+        calls.append('actor')
+        assert obs is captured['obs']
+        assert agent._update_count == step
+        assert int(agent._critic_1_optimizer.iterations.numpy()) == step
+        loss = original_actor(obs)
+        captured['losses']['actor_loss'] = float(loss.numpy())
+        return loss
+
+    def targets():
+        calls.append('targets')
+        assert int(agent._actor_optimizer.iterations.numpy()) == step // delay
+        original_targets()
+
+    monkeypatch.setattr(agent._replay_buffer, 'sample', sample)
+    monkeypatch.setattr(agent, '_compute_bellman_target', target)
+    monkeypatch.setattr(agent, '_update_critics', critics)
+    monkeypatch.setattr(agent, '_update_actor', actor)
+    monkeypatch.setattr(agent, '_update_target_networks', targets)
+    replay_before = _replay_state(agent)
+    exploration_before = agent._exploration_rng.bit_generator.state
+    for step in range(1, 5):
+        calls.clear()
+        actor_before = _snapshot(_actor_state(agent))
+        targets_before = _snapshot(_target_state(agent))
+        metrics = agent.update()
+        due = step % delay == 0
+        assert calls == ['sample', 'target', 'critics'] + (['actor', 'targets'] if due else [])
+        assert metrics == captured['losses']
+        assert set(metrics) == {'critic_1_loss', 'critic_2_loss'} | ({'actor_loss'} if due else set())
+        assert all(type(v) is float and np.isfinite(v) for v in metrics.values())
+        assert agent._update_count == step
+        assert int(agent._critic_1_optimizer.iterations.numpy()) == step
+        assert int(agent._critic_2_optimizer.iterations.numpy()) == step
+        assert int(agent._actor_optimizer.iterations.numpy()) == step // delay
+        if due:
+            assert any(not np.array_equal(v.numpy(), old) for v, old in
+                       zip(_target_state(agent), targets_before, strict = True))
+        else:
+            _unchanged(_actor_state(agent), actor_before)
+            _unchanged(_target_state(agent), targets_before)
+        assert agent._exploration_rng.bit_generator.state == exploration_before
+        _assert_replay_unchanged(agent, replay_before)
+
+
+def test_update_reproducible_with_independent_equal_seeds(agent):
+    keras.utils.set_random_seed(42)
+    other = TD3Agent(agent._spec, agent._config, seed = 42)
+    _fill_replay(agent, 8)
+    _fill_replay(other, 8)
+    for _ in range(4):
+        a = agent.update()
+        b = other.update()
+        assert a.keys() == b.keys()
+        assert a == pytest.approx(b, rel = 1e-6, abs = 1e-7)
+        for left, right in zip(_learning_state(agent), _learning_state(other), strict = True):
+            np.testing.assert_allclose(left.numpy(), right.numpy(), rtol = 1e-6, atol = 1e-7)
+        assert _rng_states(agent) == _rng_states(other)
+        assert agent._update_count == other._update_count
+
+
+def test_update_samples_and_draws_noise_once(agent):
+    _fill_replay(agent, 8)
+    reference = np.random.SeedSequence(42).spawn(3)
+    buffer_rng = np.random.default_rng(int(reference[0].generate_state(1)[0]))
+    noise_rng = np.random.default_rng(reference[2])
+    exploration_before = agent._exploration_rng.bit_generator.state
+    for _ in range(4):
+        buffer_rng.choice(8, size = 4, replace = False)
+        noise_rng.normal(0., 0.2, size = (4, 2))
+        assert agent.update() is not None
+        assert agent._replay_buffer._rng.bit_generator.state == buffer_rng.bit_generator.state
+        assert agent._target_noise_rng.bit_generator.state == noise_rng.bit_generator.state
+        assert agent._exploration_rng.bit_generator.state == exploration_before
+
+
+@pytest.mark.parametrize('stage', ['target', 'critic_2', 'actor', 'targets'])
+def test_update_failure_is_fatal_and_preserves_completed_work(agent, monkeypatch, stage):
+    monkeypatch.setattr(agent, '_config', agent._config.model_copy(update = {'policy_delay': 1}))
+    _fill_replay(agent)
+    error = AgentNumericalError('injected numerical failure')
+    targets_before = _snapshot(_target_state(agent))
+    actor_before = _snapshot(_actor_state(agent))
+    critics_before = _snapshot(_main_critic_state(agent))
+
+    def fail(*args, **kwargs):
+        raise error
+
+    if stage == 'target':
+        monkeypatch.setattr(agent, '_compute_bellman_target', fail)
+    elif stage == 'critic_2':
+        # The first Adam has already succeeded when the second raises.
+        monkeypatch.setattr(agent._critic_2_optimizer, 'apply_gradients', fail)
+    elif stage == 'actor':
+        monkeypatch.setattr(agent, '_update_actor', fail)
+    else:
+        monkeypatch.setattr(agent, '_update_target_networks', fail)
+
+    with pytest.raises(AgentNumericalError) as caught:
+        agent.update()
+    assert caught.value is error
+    assert agent._update_count == int(stage in ('actor', 'targets'))
+    assert int(agent._critic_1_optimizer.iterations.numpy()) == int(stage != 'target')
+    assert int(agent._critic_2_optimizer.iterations.numpy()) == int(stage in ('actor', 'targets'))
+    assert int(agent._actor_optimizer.iterations.numpy()) == int(stage == 'targets')
+    _unchanged(_target_state(agent), targets_before)
+    if stage != 'targets':
+        _unchanged(_actor_state(agent), actor_before)
+    if stage == 'target':
+        _unchanged(_main_critic_state(agent), critics_before)
+
+
+def test_update_propagates_unexpected_exception(agent, monkeypatch):
+    _fill_replay(agent)
+    error = RuntimeError('unexpected sampling failure')
+
+    def fail(size):
+        raise error
+
+    monkeypatch.setattr(agent._replay_buffer, 'sample', fail)
+    with pytest.raises(RuntimeError) as caught:
+        agent.update()
+    assert caught.value is error
+    assert agent._update_count == 0
