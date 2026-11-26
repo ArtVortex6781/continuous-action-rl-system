@@ -39,10 +39,7 @@ def _as_float32_vector(value: Any, dimension: int, name: str) -> np.ndarray:
     array = np.asarray(value)
     if array.shape != (dimension,):
         raise ValueError(f"{name} must have shape ({dimension},), got {array.shape}")
-    if not (
-            np.issubdtype(array.dtype, np.integer)
-            or np.issubdtype(array.dtype, np.floating)
-    ):
+    if array.dtype.kind not in ("i", "u", "f"):
         raise TypeError(f"{name} must contain real numeric values, got {array.dtype}")
 
     with np.errstate(over = "ignore", invalid = "ignore"):
@@ -63,10 +60,7 @@ def _as_float32_reward(value: Any) -> np.float32:
     array = np.asarray(value)
     if array.ndim != 0:
         raise ValueError(f"reward must be a scalar, got shape {array.shape}")
-    if not (
-            np.issubdtype(array.dtype, np.integer)
-            or np.issubdtype(array.dtype, np.floating)
-    ):
+    if array.dtype.kind not in ("i", "u", "f"):
         raise TypeError(f"reward must be a real numeric scalar, got {array.dtype}")
 
     with np.errstate(over = "ignore", invalid = "ignore"):
