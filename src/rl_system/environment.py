@@ -18,7 +18,7 @@ from rl_system.exceptions import (
 
 
 def _copy_action_bound(value: np.ndarray, name: str, action_dim: int) -> np.ndarray:
-    """Validate and copy a vector of action bounds.
+    """Validate and copy a float32 vector of action bounds.
 
     :param value: lower or upper action bounds
     :param name: bound name used in error messages
@@ -30,8 +30,8 @@ def _copy_action_bound(value: np.ndarray, name: str, action_dim: int) -> np.ndar
 
     if bounds.ndim != 1 or bounds.shape[0] != action_dim:
         raise ValueError(f"{name} must have shape ({action_dim},), got {bounds.shape}")
-    if bounds.dtype.kind not in ("i", "u", "f"):
-        raise ValueError(f"{name} must have a real numeric dtype, got {bounds.dtype}")
+    if bounds.dtype != np.float32:
+        raise ValueError(f"{name} must have dtype float32, got {bounds.dtype}")
     if not np.all(np.isfinite(bounds)):
         raise ValueError(f"{name} must contain only finite numbers")
 
@@ -45,8 +45,8 @@ class EnvironmentSpec:
 
     :param observation_dim: positive number of observation coordinates
     :param action_dim: positive number of action coordinates
-    :param action_low: lower bound for each action coordinate
-    :param action_high: upper bound for each action coordinate
+    :param action_low: float32 lower bound for each action coordinate
+    :param action_high: float32 upper bound for each action coordinate
     :raises ValueError: if dimensions or bounds violate the spec invariants
     """
 
@@ -79,7 +79,8 @@ def _box_vector_dim(space: gym.Space, name: str, *, allow_integer: bool) -> int:
 
     :param space: Gymnasium observation or action space
     :param name: space name used in error messages
-    :param allow_integer: whether integer Box dtypes are supported
+    :param allow_integer: whether real numeric dtypes are supported;
+        otherwise require float32
     :return: positive vector dimension
     :raises UnsupportedSpaceError: if the space shape, type, or dtype is unsupported
     """
@@ -92,11 +93,14 @@ def _box_vector_dim(space: gym.Space, name: str, *, allow_integer: bool) -> int:
             f"{name} must have a nonempty 1-D shape, got {space.shape}"
         )
 
-    allowed_kinds = ("i", "u", "f") if allow_integer else ("f",)
-    if space.dtype.kind not in allowed_kinds:
-        expected = "real or integer" if allow_integer else "real floating-point"
+    if allow_integer:
+        if space.dtype.kind not in ("i", "u", "f"):
+            raise UnsupportedSpaceError(
+                f"{name} must have a real or integer dtype, got {space.dtype}"
+            )
+    elif space.dtype != np.float32:
         raise UnsupportedSpaceError(
-            f"{name} must have a {expected} dtype, got {space.dtype}"
+            f"{name} must have dtype float32, got {space.dtype}"
         )
     return space.shape[0]
 
