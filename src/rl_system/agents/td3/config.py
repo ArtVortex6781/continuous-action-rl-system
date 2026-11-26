@@ -52,16 +52,16 @@ class TD3Config(BaseModel):
 
     :param replay_capacity: maximum number of transitions in the Replay Buffer.
     :param batch_size: number of unique transitions per sampled minibatch.
-    :param gamma: reward discount factor, in ``[0, 1)``.
-    :param tau: target-network soft-update coefficient, in ``(0, 1]``.
-    :param actor_learning_rate: positive Adam learning rate for the Actor.
-    :param critic_learning_rate: positive Adam learning rate for both Critics.
-    :param policy_delay: number of Critic gradient updates per Actor update.
-    :param exploration_noise_std: nonnegative standard deviation of exploration noise.
-    :param target_policy_noise_std: nonnegative standard deviation of target noise.
-    :param target_noise_clip: nonnegative magnitude limit for target noise.
-    :param actor_output_init_limit: positive half-width of the Actor output kernel
-        initialization range.
+    :param gamma: reward discount factor, in ``[0, 0.999999]``.
+    :param tau: target-network soft-update coefficient, in ``[1e-6, 1]``.
+    :param actor_learning_rate: Adam learning rate for the Actor, in ``[1e-8, 1]``.
+    :param critic_learning_rate: Adam learning rate for both Critics, in ``[1e-8, 1]``.
+    :param policy_delay: number of successful Critic update pairs per Actor update.
+    :param exploration_noise_std: standard deviation of exploration noise, in ``[0, 1]``.
+    :param target_policy_noise_std: standard deviation of target noise, in ``[0, 1]``.
+    :param target_noise_clip: magnitude limit for target noise, in ``[0, 1]``.
+    :param actor_output_init_limit: half-width of the Actor output kernel
+        initialization range, in ``[1e-8, 0.1]``.
     :param actor: hidden-layer configuration for the Actor.
     :param critic: hidden-layer configuration used by both independent Critics.
     :raises pydantic.ValidationError: if a required field or cross-field constraint
@@ -75,19 +75,19 @@ class TD3Config(BaseModel):
     replay_capacity: _PositiveInt
     batch_size: _PositiveInt
 
-    gamma: float = Field(ge = 0.0, lt = 1.0)
-    tau: float = Field(gt = 0.0, le = 1.0)
+    gamma: float = Field(ge = 0.0, le = 0.999999)
+    tau: float = Field(ge = 1e-6, le = 1.0)
 
-    actor_learning_rate: float = Field(gt = 0.0)
-    critic_learning_rate: float = Field(gt = 0.0)
+    actor_learning_rate: float = Field(ge = 1e-8, le = 1.0)
+    critic_learning_rate: float = Field(ge = 1e-8, le = 1.0)
 
     policy_delay: _PositiveInt
 
-    exploration_noise_std: float = Field(ge = 0.0)
-    target_policy_noise_std: float = Field(ge = 0.0)
-    target_noise_clip: float = Field(ge = 0.0)
+    exploration_noise_std: float = Field(ge = 0.0, le = 1.0)
+    target_policy_noise_std: float = Field(ge = 0.0, le = 1.0)
+    target_noise_clip: float = Field(ge = 0.0, le = 1.0)
 
-    actor_output_init_limit: float = Field(gt = 0.0)
+    actor_output_init_limit: float = Field(ge = 1e-8, le = 0.1)
 
     actor: MLPConfig
     critic: MLPConfig
