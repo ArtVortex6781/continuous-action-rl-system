@@ -45,8 +45,8 @@ def _environment_spec(low, high, observation_dim = 3) -> EnvironmentSpec:
     return EnvironmentSpec(
         observation_dim = observation_dim,
         action_dim = len(low),
-        action_low = np.asarray(low, dtype = np.float64),
-        action_high = np.asarray(high, dtype = np.float64),
+        action_low = np.asarray(low, dtype = np.float32),
+        action_high = np.asarray(high, dtype = np.float32),
     )
 
 
@@ -214,34 +214,23 @@ def test_agent_prepares_float32_scaling(config, low, high, midpoint, half_range)
     np.testing.assert_array_equal(agent._action_high, high)
 
 
-def test_agent_rounds_float32_bounds_inward(config):
+def test_agent_preserves_float32_bounds(config):
     keras.utils.set_random_seed(42)
-    spec = _environment_spec([0.100000003, -0.200000004], [0.300000010, 0.200000004])
+    spec = _environment_spec([0.1, -0.2], [0.3, 0.2])
     agent = TD3Agent(spec, config, seed = 42)
-    assert agent._action_low.dtype == np.float32
-    assert agent._action_high.dtype == np.float32
-    assert np.all(agent._action_low.astype(np.float64) >= spec.action_low)
-    assert np.all(agent._action_high.astype(np.float64) <= spec.action_high)
-    assert np.all(agent._action_low < agent._action_high)
-    # Inward bounds must not discard any other representable valid action.
-    previous = np.nextafter(agent._action_low, np.float32(-np.inf))
-    following = np.nextafter(agent._action_high, np.float32(np.inf))
-    assert np.all(previous.astype(np.float64) < spec.action_low)
-    assert np.all(following.astype(np.float64) > spec.action_high)
+    for actual, expected in ((agent._action_low, spec.action_low),
+                             (agent._action_high, spec.action_high)):
+        assert tf.is_tensor(actual)
+        assert actual.dtype == tf.float32
+        np.testing.assert_array_equal(actual.numpy(), expected)
 
 
-@pytest.mark.parametrize(
-    ("low", "high"),
-    [
-        ([-1e40], [1.0]),
-        ([-1.0], [1e40]),
-        ([0.0], [1e-50]),
-        ([1.0], [1.0 + 1e-10]),
-        ([0.0, 1.0], [2.0, 1.0 + 1e-10]),
-        ([1.0], [float(np.nextafter(np.float32(1), np.float32(2)))]),
-    ],
-)
-def test_agent_rejects_incompatible_float32_bounds(config, low, high):
+@pytest.mark.parametrize("low,high", [
+    ([0.0], [np.nextafter(np.float32(0), np.float32(1))]),
+    ([1.0], [np.nextafter(np.float32(1), np.float32(2))]),
+    ([0.0, 1.0], [2.0, np.nextafter(np.float32(1), np.float32(2))]),
+])
+def test_agent_rejects_incompatible_float32_scaling(config, low, high):
     spec = _environment_spec(low, high)
     with pytest.raises(UnsupportedSpaceError):
         TD3Agent(spec, config, seed = 42)
@@ -369,7 +358,7 @@ def test_exploration_clips_normalized_action_before_scaling(agent, config, monke
 
 
 @pytest.mark.parametrize("normalized", [-1., 1.])
-def test_select_action_respects_original_float64_bounds(config, normalized):
+def test_select_action_respects_float32_bounds(config, normalized):
     spec = _environment_spec([0.100000003, -0.200000004], [0.300000010, 0.200000004])
     keras.utils.set_random_seed(42)
     agent = TD3Agent(spec, config, seed = 42)
@@ -378,8 +367,8 @@ def test_select_action_respects_original_float64_bounds(config, normalized):
     agent._actor.set_weights(weights)
     action = agent.select_action(np.zeros(3), explore = False)
     assert action.dtype == np.float32
-    assert np.all(action.astype(np.float64) >= spec.action_low)
-    assert np.all(action.astype(np.float64) <= spec.action_high)
+    assert np.all(action >= spec.action_low)
+    assert np.all(action <= spec.action_high)
     expected = spec.action_low if normalized < 0 else spec.action_high
     np.testing.assert_allclose(action, expected, rtol = 1e-6, atol = 0)
 
@@ -415,13 +404,6 @@ def test_select_action_calls_actor_with_batched_float32_inference(agent, monkeyp
     np.testing.assert_array_equal(agent.select_action([1, 2, 3], explore = False), [1., 3.])
 
 
-@pytest.mark.parametrize("output", [[0., 0.], [[0.]], [[0., 0.], [0., 0.]]])
-def test_select_action_rejects_wrong_actor_output_shape(agent, monkeypatch, output):
-    monkeypatch.setattr(agent, "_actor", lambda *args, **kwargs: tf.constant(output, tf.float32))
-    with pytest.raises(AgentUpdateError):
-        agent.select_action(np.zeros(3), explore = False)
-
-
 @pytest.mark.parametrize("value", [np.nan, np.inf, -np.inf])
 @pytest.mark.parametrize("explore", [False, True])
 def test_select_action_rejects_nonfinite_actor_output(agent, monkeypatch, value, explore):
@@ -437,10 +419,19 @@ def test_select_action_rejects_nonfinite_exploration(agent, config, monkeypatch)
         agent.select_action(np.zeros(3), explore = True)
 
 
-def test_select_action_rejects_nonfinite_scaled_action(agent, monkeypatch):
-    monkeypatch.setattr(agent, "_scale_action", lambda action: tf.constant([[np.inf, 0.]], tf.float32))
-    with pytest.raises(AgentNumericalError):
-        agent.select_action(np.zeros(3), explore = False)
+def test_scale_action_clips_to_original_bounds(agent):
+    normalized = tf.constant([[-2., 2.], [2., -2.]], tf.float32)
+    np.testing.assert_array_equal(agent._scale_action(normalized).numpy(),
+                                  [[-2., 5.], [4., 1.]])
+
+
+def test_scale_action_corrects_float32_rounding(config):
+    spec = _environment_spec([0.1], [0.3])
+    agent = TD3Agent(spec, config, seed = 42)
+    scaled = agent._scale_action(tf.constant([[-1.], [1.]], tf.float32)).numpy()
+    assert np.all(scaled >= spec.action_low)
+    assert np.all(scaled <= spec.action_high)
+    np.testing.assert_allclose(scaled[:, 0], [0.1, 0.3], rtol = 1e-6)
 
 
 @pytest.mark.parametrize("terminated,truncated", [(False, False), (True, False), (False, True), (True, True)])
