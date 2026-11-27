@@ -25,7 +25,17 @@ def test_td3_pendulum_smoke(tmp_path):
             'actor': {'hidden_units': [8, 8], 'hidden_activations': ['relu', 'relu']},
             'critic': {'hidden_units': [8, 8], 'hidden_activations': ['relu', 'relu']},
         }},
-        'training': {'total_steps': 10, 'seed': seed},
+        'training': {
+            'total_steps': 10, 'seed': seed,
+            'warmup_steps': 0, 'learning_starts': 1,
+            'train_frequency': 1, 'gradient_steps': 1,
+            'progress': {
+                'step_interval': 0, 'episode_interval': 0,
+                'episode_start': 1, 'reward_window': 0,
+                'show_update_count': False, 'show_update_metrics': False,
+                'show_metric_counts': False, 'show_throughput': False,
+            },
+        },
     }), encoding = 'utf-8')
     config = load_config(config_path)
     td3_config = TD3Config.model_validate(config.algorithm.params)
