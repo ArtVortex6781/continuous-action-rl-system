@@ -336,7 +336,7 @@ def test_example_yaml_loads_through_general_and_td3_specific_configuration():
     assert isinstance(run_config, RunConfig)
     assert run_config.environment.id == "Pendulum-v1"
     assert run_config.environment.kwargs == {}
-    assert run_config.training.total_steps == 100_000
+    assert run_config.training.total_steps == 35_000
     assert run_config.training.seed == 42
     assert run_config.algorithm.name == "td3"
     assert run_config.algorithm.params == _valid_td3_params()
