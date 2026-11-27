@@ -1,3 +1,9 @@
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from rl_system.training import TrainingResult
+
+
 class RLSystemError(Exception):
     """Базовое исключение RL-системы."""
 
@@ -44,3 +50,19 @@ class AgentUpdateError(AgentSystemError):
 
 class AgentNumericalError(AgentSystemError):
     """Неконечное значение внутренних вычислений или состояния агента."""
+
+
+class TrainingError(RLSystemError):
+    """Ошибка обучения с доступным частичным результатом.
+
+    :param message: описание ошибки обучения.
+    :param result: частичный результат без копирования истории метрик.
+    """
+
+    def __init__(self, message: str, result: "TrainingResult") -> None:
+        super().__init__(message)
+        self.result = result
+
+
+class TrainingInterruptedError(TrainingError):
+    """Обучение прервано пользователем; доступен частичный результат."""
