@@ -1,6 +1,7 @@
 """Sequential off-policy training with complete in-memory metric histories."""
 
 import time
+from statistics import mean
 from typing import TypedDict
 
 import gymnasium as gym
@@ -130,6 +131,110 @@ class Trainer:
             "partial_episode": partial_episode,
         }
 
+    @staticmethod
+    def _group_update_metrics(
+            records: list[UpdateMetrics],
+    ) -> dict[str, list[float]]:
+        """Group observed metric values by key, preserving their update order."""
+        values_by_key: dict[str, list[float]] = {}
+        for record in records:
+            for name, value in record["metrics"].items():
+                values_by_key.setdefault(name, []).append(value)
+        return values_by_key
+
+    def _report_progress(
+            self,
+            *,
+            global_step: int,
+            episode_metrics: list[EpisodeMetrics],
+            update_metrics: list[UpdateMetrics],
+            last_report_step: int,
+            last_report_episode_count: int,
+            last_report_update_count: int,
+            start_time: float,
+            last_report_time: float,
+    ) -> float:
+        """Print one progress report and return its measurement timestamp.
+
+        Only newly recorded updates enter the interval statistics. The timestamp
+        is sampled before printing so the next interval includes this report's
+        output cost.
+        """
+        now = time.perf_counter()
+        elapsed = now - start_time
+        progress = self._config.progress
+        total_steps = self._config.total_steps
+        episode_count = len(episode_metrics)
+        update_count = len(update_metrics)
+
+        lines = [
+            f"Steps: {global_step} / {total_steps} ({global_step / total_steps:.2%})",
+            f"Episodes: {episode_count}",
+            f"Elapsed: {elapsed:.2f} s",
+        ]
+        if progress.show_update_count:
+            lines.append(f"Updates: {update_count}")
+
+        if episode_count > last_report_episode_count:
+            last = episode_metrics[-1]
+            lines.extend([
+                "",
+                f"Last episode: {last['episode']}",
+                f"  Reward: {last['episode_reward']:.6g} | Length: {last['episode_length']}",
+                f"  Terminated: {last['terminated']} | Truncated: {last['truncated']}",
+            ])
+
+        if progress.reward_window > 0 and episode_metrics:
+            rewards = [
+                record["episode_reward"]
+                for record in episode_metrics[-progress.reward_window:]
+            ]
+            lines.extend([
+                "",
+                f"Rewards (last {len(rewards)} completed episodes):",
+                f"  min={min(rewards):.6g} mean={mean(rewards):.6g} max={max(rewards):.6g}",
+            ])
+
+        if progress.show_update_metrics and update_count > last_report_update_count:
+            values_by_key = self._group_update_metrics(
+                update_metrics[last_report_update_count:]
+            )
+            if values_by_key:
+                lines.extend([
+                    "",
+                    f"Update metrics (steps {last_report_step + 1}–{global_step}):",
+                ])
+                for name, values in values_by_key.items():
+                    summary = (
+                        f"  {name}: min={min(values):.6g} mean={mean(values):.6g} "
+                        f"max={max(values):.6g} last={values[-1]:.6g}"
+                    )
+                    if progress.show_metric_counts:
+                        summary += f" count={len(values)}"
+                    lines.append(summary)
+
+        if progress.show_throughput:
+            lines.extend(["", "Throughput:"])
+            for label, steps, updates, duration in (
+                    ("overall", global_step, update_count, elapsed),
+                    (
+                            "interval",
+                            global_step - last_report_step,
+                            update_count - last_report_update_count,
+                            now - last_report_time,
+                    ),
+            ):
+                if duration > 0:
+                    lines.append(
+                        f"  {label}: {steps / duration:.2f} steps/s | "
+                        f"{updates / duration:.2f} updates/s"
+                    )
+                else:
+                    lines.append(f"  {label}: N/A steps/s | N/A updates/s")
+
+        print("\n".join(lines), flush = True)
+        return now
+
     def train(self) -> TrainingResult:
         """Run training once within the configured environment step budget.
 
@@ -149,6 +254,12 @@ class Trainer:
         update_metrics: list[UpdateMetrics] = []
         config = self._config
         start_time = time.perf_counter()
+        progress = config.progress
+        reporting_enabled = progress.step_interval > 0 or progress.episode_interval > 0
+        last_report_step = 0
+        last_report_episode_count = 0
+        last_report_update_count = 0
+        last_report_time = start_time
 
         try:
             observation = self._initialize_environment()
@@ -195,6 +306,33 @@ class Trainer:
                             "update": len(update_metrics) + 1,
                             "metrics": metrics,
                         })
+
+                if reporting_enabled:
+                    episode_count = len(episode_metrics)
+                    step_due = (
+                            progress.step_interval > 0
+                            and global_step - last_report_step >= progress.step_interval
+                    )
+                    episode_due = (
+                            episode_finished
+                            and progress.episode_interval > 0
+                            and episode_count >= progress.episode_start
+                            and (episode_count - progress.episode_start) % progress.episode_interval == 0
+                    )
+                    if step_due or episode_due or step == config.total_steps:
+                        last_report_time = self._report_progress(
+                            global_step = global_step,
+                            episode_metrics = episode_metrics,
+                            update_metrics = update_metrics,
+                            last_report_step = last_report_step,
+                            last_report_episode_count = last_report_episode_count,
+                            last_report_update_count = last_report_update_count,
+                            start_time = start_time,
+                            last_report_time = last_report_time,
+                        )
+                        last_report_step = global_step
+                        last_report_episode_count = episode_count
+                        last_report_update_count = len(update_metrics)
 
                 if episode_finished and step < config.total_steps:
                     observation, _ = self._env.reset()
