@@ -31,5 +31,18 @@ algorithm:
       hidden_activations: [relu, relu]
 
 training:
-  total_steps: 100000
+  total_steps: 35000
   seed: 42
+  warmup_steps: 1000
+  learning_starts: 1000
+  train_frequency: 1
+  gradient_steps: 1
+  progress:
+    step_interval: 1000
+    episode_interval: 2
+    episode_start: 30
+    reward_window: 10
+    show_update_count: true
+    show_update_metrics: true
+    show_metric_counts: true
+    show_throughput: true
