@@ -1,10 +1,10 @@
 import math
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
 import yaml
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from rl_system.exceptions import InvalidConfigError
 
@@ -112,18 +112,67 @@ class AlgorithmConfig(BaseModel):
         return _validate_json_mapping(value)
 
 
-class TrainingConfig(BaseModel):
-    """Common training limits and required reproducibility seed.
+class ProgressConfig(BaseModel):
+    """Console progress reporting schedule and diagnostic options.
 
-    :param total_steps: strictly positive integer number of training steps.
-    :param seed: required nonnegative integer random seed.
+    :param step_interval: maximum steps between reports; zero disables step scheduling.
+    :param episode_interval: episode reporting period; zero disables episode scheduling.
+    :param episode_start: first episode eligible for episode-based reporting.
+    :param reward_window: number of completed episodes in reward statistics; zero disables them.
+    :param show_update_count: include the total number of successful updates.
+    :param show_update_metrics: include statistics of new agent metrics.
+    :param show_metric_counts: include counts in the update metrics block when enabled.
+    :param show_throughput: include overall and interval throughput.
     :raises pydantic.ValidationError: if a field is missing or invalid.
     """
 
     model_config = ConfigDict(extra = "forbid", frozen = True, strict = True)
 
+    step_interval: int = Field(ge = 0)
+    episode_interval: int = Field(ge = 0)
+    episode_start: int = Field(ge = 1)
+    reward_window: int = Field(ge = 0)
+    show_update_count: bool
+    show_update_metrics: bool
+    show_metric_counts: bool
+    show_throughput: bool
+
+
+class TrainingConfig(BaseModel):
+    """Common training budget, reproducibility seed, schedules and diagnostics.
+
+    :param total_steps: positive number of environment steps.
+    :param seed: run seed in the inclusive range [0, 2**32 - 1].
+    :param warmup_steps: initial random-action steps, from zero to total_steps.
+    :param learning_starts: first step eligible for updates, from one to total_steps.
+    :param train_frequency: positive interval between update series in environment steps.
+    :param gradient_steps: maximum number of agent update calls per series.
+    :param progress: console progress reporting settings.
+    :raises pydantic.ValidationError: if a field or cross-field constraint is invalid.
+    """
+
+    model_config = ConfigDict(extra = "forbid", frozen = True, strict = True)
+
     total_steps: int = Field(gt = 0)
-    seed: int = Field(ge = 0)
+    seed: int = Field(ge = 0, le = 2 ** 32 - 1)
+    warmup_steps: int = Field(ge = 0)
+    learning_starts: int = Field(ge = 1)
+    train_frequency: int = Field(ge = 1)
+    gradient_steps: int = Field(ge = 1)
+    progress: ProgressConfig
+
+    @model_validator(mode = "after")
+    def validate_step_limits(self) -> Self:
+        """Ensure warm-up and learning start fit within the training budget.
+
+        :return: the validated training configuration.
+        :raises ValueError: if either step limit exceeds total_steps.
+        """
+        if self.warmup_steps > self.total_steps:
+            raise ValueError("warmup_steps must not exceed total_steps")
+        if self.learning_starts > self.total_steps:
+            raise ValueError("learning_starts must not exceed total_steps")
+        return self
 
 
 class RunConfig(BaseModel):
